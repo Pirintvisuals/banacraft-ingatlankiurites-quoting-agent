@@ -67,12 +67,36 @@ npm start          # http://localhost:8893
 npm test           # clicks through hundreds of random conversations + sample quotes
 ```
 
-Environment variables: see `.env.example` (copy to `.env.local` locally; set the
-same names in Vercel → Settings → Environment Variables). Without `RESEND_API_KEY`
-no e-mail goes out; without an AI key typed messages fall back to the buttons.
+Locally, copy `.env.example` to `.env.local`. Without `RESEND_API_KEY` no e-mail
+goes out; without an AI key typed messages fall back to the buttons.
 
-Deploy: push to a GitHub repo and import it in Vercel (no build step).
-`GET /api/faq-agent?selftest=1` sends a test e-mail and reports what Resend said.
+## Deploy on Vercel
+
+1. Vercel → **Add New… → Project** → import
+   `Pirintvisuals/banacraft-ingatlankiurites-quoting-agent`.
+2. **Framework Preset:** Other. Leave Root Directory, Build Command and Output
+   Directory empty - there is no build; Vercel serves `public/` and turns
+   `api/faq-agent.js` into the function.
+3. **Environment Variables** (before the first deploy):
+
+   | Name | Value |
+   |---|---|
+   | `AI_PROVIDER` | `gemini` or `openai` |
+   | `GEMINI_API_KEY` or `OPENAI_API_KEY` | the key for that provider |
+   | `RESEND_API_KEY` | Resend key |
+   | `LEAD_EMAIL_TO` | `info@banacraft.hu` |
+   | `LEAD_EMAIL_FROM` | a sender on a **verified** Resend domain, e.g. `Banacraft <ajanlat@send.traumbad.hu>` |
+   | `ZOHO_FLOW_WEBHOOK_URL` | optional |
+   | `OWNER_TEST_KEY` | optional - protects the self-test below |
+
+   Without `LEAD_EMAIL_FROM` it falls back to Resend's test sender, which only
+   delivers to the Resend account owner's own address - not to info@banacraft.hu.
+4. **Deploy.** Then check:
+   - `https://YOUR-PROJECT.vercel.app/` - the demo page with the widget
+   - `https://YOUR-PROJECT.vercel.app/api/faq-agent?selftest=1` - sends a test
+     e-mail and reports what Resend answered
+
+Changing an environment variable later needs a redeploy to take effect.
 
 ## Embedding on the Banacraft site
 

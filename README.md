@@ -82,10 +82,10 @@ goes out; without an AI key typed messages fall back to the buttons.
    | Name | Value |
    |---|---|
    | `AI_PROVIDER` | `gemini` or `openai` |
-   | `GEMINI_API_KEY` or `OPENAI_API_KEY` | the key for that provider |
-   | `RESEND_API_KEY` | Resend key |
+   | `GEMINI_API_KEY` or `OPENAI_API_KEY` | a key created just for Banacraft (not NM Bau's) |
+   | `RESEND_API_KEY` | a Resend API key created just for Banacraft |
    | `LEAD_EMAIL_TO` | `info@banacraft.hu` |
-   | `LEAD_EMAIL_FROM` | a sender on a **verified** Resend domain, e.g. `Banacraft <ajanlat@send.traumbad.hu>` |
+   | `LEAD_EMAIL_FROM` | a sender on a **verified** Resend domain, e.g. `Banacraft <ajanlat@banacraft.hu>` once banacraft.hu is verified in Resend |
    | `ZOHO_FLOW_WEBHOOK_URL` | optional |
    | `OWNER_TEST_KEY` | optional - protects the self-test below |
 

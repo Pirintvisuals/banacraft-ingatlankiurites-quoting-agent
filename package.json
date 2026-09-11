@@ -1,0 +1,13 @@
+{
+  "name": "banacraft-kiurites-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-flow.mjs"
+  },
+  "dependencies": {
+    "@vercel/functions": "^3.9.7"
+  }
+}

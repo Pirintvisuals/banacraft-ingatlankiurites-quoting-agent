@@ -7,7 +7,7 @@
     id: "banacraft-kiurites",
     subtitle: "Kiürítés és takarítás árbecslő",
     phone: "+36 70 625 2014",
-    greeting: "Üdvözlöm! A **Banacraft** árbecslő asszisztense vagyok.\n\nNéhány gyors kérdés alapján kiszámolom a **kiürítés vagy a takarítás alapárát** - ingyen, kötelezettség nélkül.\n\nKözben **bármit megkérdezhet**.",
+    greeting: "Üdvözlöm! A **Banacraft** árbecslő asszisztense vagyok.\n\nNéhány gyors kattintással, kb. 1-2 perc alatt kiszámolom a **kiürítés vagy a takarítás alapárát** - ingyen, kötelezettség nélkül.\n\nKözben **bármit megkérdezhet**.",
     hint: "Kérdezzen bátran - pl. mit visznek el, vagy ott kell-e lennie",
     teasers: [
       "Mennyibe kerül egy lakás kiürítése?",
@@ -44,6 +44,15 @@
     dialogAria: "Banacraft árbecslő asszisztens",
     concept: "Előzetes, tájékoztató becslés. A végleges árat az ingyenes helyszíni felmérés után adjuk.",
     next: "Tovább",
+    back: "Vissza",
+    backSaid: "Vissza az előző kérdéshez",
+    retry: "Újrapróbálom",
+    callbackOpen: "Inkább visszahívást kérek",
+    callbackTitle: "Hova hívhatjuk vissza?",
+    callbackWhy: "Az eddigi válaszait is megkapja a kollégánk, így nem kell újra elmondania.",
+    callbackSubmit: "Kérem a visszahívást",
+    callbackSaid: "Visszahívást kérek",
+    cancel: "Mégse",
     errGeneric: "Elnézést, hiba történt. Kérjük, próbálja újra, vagy hívjon minket: " + PHONE,
     errConnect: "Elnézést, nem sikerült kapcsolódni. Kérjük, próbálja újra, vagy hívjon minket: " + PHONE,
   };
@@ -55,16 +64,31 @@
   const POSTHOG_KEY = config.posthogKey || "phc_nroFe9H8K9hbVENBqcRRrWW9GXxoyVZhSomy3U8Zhu4P";
   const POSTHOG_HOST = config.posthogHost || "https://eu.i.posthog.com";
   const CLIENT_ID = config.client || BOT.id;
-  const WIDGET_VERSION = "2026-09-11";
+  const WIDGET_VERSION = "2026-10-30";
   const SESSION_REPLAY = config.sessionReplay !== false;
 
+  // PostHog loads when the browser is idle or the chat opens, so it never slows
+  // the host page down. Events from before that wait here.
+  let analyticsStarted = false;
+  let queuedEvents = [];
+
   function track(event, props) {
+    if (!analyticsStarted) { queuedEvents.push([event, props]); return; }
     try {
       if (window.posthog && typeof window.posthog.capture === "function") window.posthog.capture(event, props || {});
     } catch (e) {}
   }
 
+  function whenIdle(fn, ms) {
+    if (window.requestIdleCallback) window.requestIdleCallback(fn, { timeout: ms });
+    else setTimeout(fn, ms);
+  }
+
   function initAnalytics() {
+    if (analyticsStarted) return;
+    analyticsStarted = true;
+    const waiting = queuedEvents;
+    queuedEvents = [];
     if (!POSTHOG_KEY || POSTHOG_KEY.indexOf("REPLACE") !== -1) return;
     !function(t,e){var o,n,p,r;e.__SV||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+".people (stub)"},o="init capture register register_once register_for_session unregister unregister_for_session getFeatureFlag getFeatureFlagPayload isFeatureEnabled reloadFeatureFlags updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures on onFeatureFlags onSessionId getSurveys getActiveMatchingSurveys renderSurvey canRenderSurvey getNextSurveyStep identify setPersonProperties group resetGroups setPersonPropertiesForFlags resetPersonPropertiesForFlags setGroupPropertiesForFlags resetGroupPropertiesForFlags reset get_distinct_id getGroups get_session_id get_session_replay_url alias set_config startSessionRecording stopSessionRecording sessionRecordingStarted captureException loadToolbar get_property getSessionProperty createPersonProfile opt_in_capturing opt_out_capturing has_opted_in_capturing has_opted_out_capturing clear_opt_in_out_capturing debug getPageViewId".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);
     try {
@@ -80,6 +104,7 @@
       });
       window.posthog.register({ client: CLIENT_ID, widget_version: WIDGET_VERSION, language: navigator.language || "" });
     } catch (e) {}
+    waiting.forEach(([event, props]) => track(event, props));
   }
 
   let container = null;
@@ -95,6 +120,35 @@
   let formEl = null;
   let progressFillEl = null, progressLabelEl = null, progressBarEl = null;
   let lastProgress = 0, lastProgressTotal = 0;
+  let shownPct = 0;             // the bar never shrinks when follow-up questions join the list
+  let lastStep = null;          // what the customer can answer right now, to put back after a failure
+  let lastField = null;
+  let backStack = [];           // the state before each recorded answer
+  let leadSent = false;         // a callback request has gone to the owner
+  let callbackLink = null;
+
+  // --- Resume after a reload -------------------------------------------------
+  // Kept in sessionStorage: it survives a reload or a discarded mobile tab, and
+  // is gone when the tab closes.
+  const SAVE_KEY = BOT.id + "_chat";
+  const SAVE_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+
+  function saveChat() {
+    try {
+      sessionStorage.setItem(SAVE_KEY, JSON.stringify({
+        at: Date.now(), state: convState, history: conversationHistory, sessionId: sessionId,
+        quoteDone: quoteDone, leadSent: leadSent, backStack: backStack,
+      }));
+    } catch (e) {}
+  }
+
+  function loadChat() {
+    try {
+      const s = JSON.parse(sessionStorage.getItem(SAVE_KEY) || "null");
+      if (s && Date.now() - s.at < SAVE_MAX_AGE_MS && Array.isArray(s.history) && s.history.some((m) => m.role === "user")) return s;
+    } catch (e) {}
+    return null;
+  }
 
   // --- Owner transcript copy ------------------------------------------------
   // The backend only e-mails a finished quote. Most visitors stop before that,
@@ -114,7 +168,7 @@
   }
 
   function flushTranscript(reason) {
-    if (quoteDone) return;
+    if (quoteDone || leadSent) return;
     if (transcriptSends >= TRANSCRIPT_MAX_SENDS) return;
     if (!conversationHistory.some((m) => m.role === "user")) return; // opened, never answered
     if (conversationHistory.length <= transcriptSentAt) return;
@@ -263,12 +317,13 @@
       setTimeout(() => { w.style.display = "none"; w.classList.remove("closing"); }, 180);
       chatOpen = false;
       if (launcher) launcher.classList.remove("active");
-      track("chat_closed", { answered: lastProgress, total: lastProgressTotal });
+      track("chat_closed", { answered: lastProgress, total: lastProgressTotal, field: lastField });
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = setTimeout(() => flushTranscript("csevegés bezárva"), TRANSCRIPT_CLOSE_MS);
       if (SHOW_LAUNCHER) setTimeout(showTeaser, 400);
     } else {
       hideTeaser();
+      initAnalytics();
       if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
       if (!chatWindow) {
         buildChat();
@@ -337,7 +392,15 @@
 
     const hintBar = document.createElement("div");
     hintBar.className = "faq-question-hint";
-    hintBar.textContent = BOT.hint;
+    const hintText = document.createElement("span");
+    hintText.textContent = BOT.hint;
+    hintBar.appendChild(hintText);
+    callbackLink = document.createElement("button");
+    callbackLink.type = "button";
+    callbackLink.className = "faq-link-btn";
+    callbackLink.textContent = T.callbackOpen;
+    callbackLink.onclick = openCallbackForm;
+    hintBar.appendChild(callbackLink);
 
     const inputBar = document.createElement("form");
     inputBar.className = "faq-chat-input";
@@ -377,11 +440,31 @@
 
     if (!started) {
       started = true;
+      const saved = loadChat();
+      if (saved) {
+        conversationHistory = saved.history;
+        convState = saved.state || {};
+        sessionId = saved.sessionId || sessionId;
+        quoteDone = !!saved.quoteDone;
+        leadSent = !!saved.leadSent;
+        backStack = Array.isArray(saved.backStack) ? saved.backStack : [];
+        transcriptSentAt = conversationHistory.length;
+        conversationHistory.forEach((m) => addMessage(m.role === "user" ? "user" : "bot", m.content));
+        track("chat_resumed");
+        updateCallbackLink();
+        if (!quoteDone) post({ action: "start", state: convState }, true);
+        return;
+      }
       track("quote_started");
       addMessage("bot", BOT.greeting);
       conversationHistory.push({ role: "assistant", content: BOT.greeting });
-      post({ action: "start", state: convState }, false);
+      updateCallbackLink();
+      post({ action: "start", state: convState }, true);
     }
+  }
+
+  function updateCallbackLink() {
+    if (callbackLink) callbackLink.hidden = quoteDone || leadSent;
   }
 
   // --- Rendering ----------------------------------------------------------------
@@ -458,18 +541,60 @@
     return chip;
   }
 
-  function renderChips(chips) {
+  // "Back" to the previous question, while there is one and no quote yet.
+  function backChip() {
+    if (quoteDone || !backStack.length) return null;
+    const chip = makeChip(T.back);
+    chip.classList.add("faq-chip--ghost");
+    chip.onclick = goBack;
+    return chip;
+  }
+
+  function renderChips(chips, call) {
     clearChips();
-    if (!chips || !chips.length) return;
+    const back = backChip();
+    if ((!chips || !chips.length) && !back && !call) return;
     const wrap = document.createElement("div");
     wrap.className = "faq-chips";
-    chips.forEach((label) => {
+    (chips || []).forEach((label) => {
       const chip = makeChip(label);
       chip.onclick = () => { clearChips(); sendMessage(label); };
       wrap.appendChild(chip);
     });
+    if (call) {
+      const a = document.createElement("a");
+      a.className = "faq-chip faq-chip-call";
+      a.href = "tel:" + call.tel;
+      a.innerHTML = ICON.phone;
+      a.appendChild(document.createTextNode(call.label));
+      a.onclick = () => track("call_cta_clicked");
+      wrap.appendChild(a);
+    }
+    if (back) wrap.appendChild(back);
     messagesContainer.appendChild(wrap);
     scrollToBottom();
+  }
+
+  // What the last reply left on screen. Also how a failed request gets the
+  // customer's buttons or form back, so a dropped connection is not a dead end.
+  function renderStep(step) {
+    if (!step) return;
+    if (step.form) renderContactForm(step.form);
+    else if (step.multi) renderMultiChips(step.chips, step.exclusive, step.next);
+    else renderChips(step.chips, step.call);
+  }
+
+  function goBack() {
+    if (sending || !backStack.length) return;
+    clearChips();
+    clearContactForm();
+    const prev = backStack.pop();
+    convState = prev;
+    addMessage("user", T.backSaid);
+    conversationHistory.push({ role: "user", content: T.backSaid });
+    track("back_clicked", { field: lastField });
+    shownPct = 0; // the bar may shrink here: the customer really did step back
+    post({ action: "start", state: convState }, true);
   }
 
   // Multi-select: toggle chips, then "Tovább". A "none of these" chip clears
@@ -522,6 +647,8 @@
       sendMessage(text);
     };
     wrap.appendChild(go);
+    const back = backChip();
+    if (back) wrap.appendChild(back);
     messagesContainer.appendChild(wrap);
     scrollToBottom();
   }
@@ -592,6 +719,15 @@
     btn.textContent = form.submit || "OK";
     wrap.appendChild(btn);
 
+    if (form.callback || backStack.length) {
+      const secondary = document.createElement("button");
+      secondary.type = "button";
+      secondary.className = "faq-link-btn faq-form-back";
+      secondary.textContent = form.callback ? T.cancel : T.back;
+      secondary.onclick = form.callback ? () => { clearContactForm(); renderStep(lastStep); } : goBack;
+      wrap.appendChild(secondary);
+    }
+
     if (form.why) {
       const why = document.createElement("div");
       why.className = "faq-form-why";
@@ -615,12 +751,20 @@
       if (sending) return;
       const values = {};
       Object.keys(inputs).forEach((k) => { values[k] = inputs[k].input.value.trim(); });
-      submitContactForm(values, form);
+      if (form.callback) submitCallback(values, form);
+      else submitContactForm(values, form);
     };
 
     messagesContainer.appendChild(wrap);
     formEl = wrap;
     scrollToBottom();
+  }
+
+  // A form that comes back keeps what the customer already typed.
+  function withValues(form, values) {
+    return Object.assign({}, form, {
+      fields: (form.fields || []).map((f) => Object.assign({}, f, { value: values[f.key] != null ? values[f.key] : f.value })),
+    });
   }
 
   async function submitContactForm(values, form) {
@@ -630,18 +774,57 @@
     // The details are echoed as the customer's own message only once ACCEPTED.
     // A rejected form comes back with the bad fields marked and the transcript
     // untouched, so a typo leaves no trace in it (or in the owner's copy).
-    const data = await post({ contact: values, history: conversationHistory, state: convState }, true, () => {
+    track("form_submitted");
+    const data = await post({ contact: values, history: conversationHistory.slice(-80), state: convState }, true, () => {
       if (!shown) return;
       addMessage("user", shown);
       conversationHistory.push({ role: "user", content: shown });
+    }, true);
+    if (!data) { renderContactForm(withValues(form, values)); return; }
+    if (data.formErrors && data.form) {
+      track("form_error", { fields: Object.keys(data.formErrors).join(",") });
+      renderContactForm(data.form, data.formErrors);
+    }
+  }
+
+  function openCallbackForm() {
+    if (sending) return;
+    clearChips();
+    track("callback_opened", { answered: lastProgress, field: lastField });
+    renderContactForm({
+      callback: true,
+      title: T.callbackTitle,
+      why: T.callbackWhy,
+      submit: T.callbackSubmit,
+      fields: [
+        { key: "name", label: "Név", placeholder: "Az Ön neve", type: "text", autocomplete: "name", value: convState.name || "" },
+        { key: "phone", label: "Telefonszám", placeholder: "+36 30 123 4567", type: "tel", autocomplete: "tel", value: convState.phone || "" },
+      ],
     });
-    if (!data) { renderContactForm(form); return; }
-    if (data.formErrors && data.form) renderContactForm(data.form, data.formErrors);
+  }
+
+  async function submitCallback(values, form) {
+    if (sending) return;
+    clearContactForm();
+    const data = await post({ action: "callback", contact: values, history: conversationHistory.slice(-80), state: convState, pageUrl: location.href }, true, (d) => {
+      if (d.callbackFailed) return;
+      addMessage("user", T.callbackSaid);
+      conversationHistory.push({ role: "user", content: T.callbackSaid });
+    }, true);
+    if (!data) { renderContactForm(withValues(form, values)); return; }
+    if (data.formErrors) { renderContactForm(withValues(form, values), data.formErrors); return; }
+    if (data.callbackDone) {
+      leadSent = true;
+      updateCallbackLink();
+      track("callback_requested", { answered: lastProgress, field: lastField });
+      saveChat();
+    }
   }
 
   function updateProgress(done, total) {
     if (!progressFillEl || !total) return;
-    const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+    const pct = Math.max(shownPct, Math.min(100, Math.round((done / total) * 100)));
+    shownPct = pct;
     progressFillEl.style.width = pct + "%";
     if (progressLabelEl) progressLabelEl.textContent = pct + "%";
     if (progressBarEl) {
@@ -653,30 +836,71 @@
   // --- Talking to the backend -----------------------------------------------------
   // One round trip. Renders the reply (bubbles + chips / multi-chips / form) and
   // returns the parsed data, or null on failure. `onAccepted` runs just before
-  // the reply renders, unless the server bounced a contact form back.
-  async function post(payload, withThinking, onAccepted) {
+  // the reply renders, unless the server bounced a contact form back. A connection
+  // that drops or a server error gets one quiet retry before the customer sees
+  // anything; if that fails too, the buttons they had come back (a caller holding
+  // a form passes keepForm and puts it back itself, with what they typed).
+  const REQUEST_TIMEOUT_MS = 20000;
+
+  async function fetchWithRetry(body) {
+    let last = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 700));
+      try {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
+        try {
+          last = await fetch(apiUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: body, signal: ac.signal });
+        } finally {
+          clearTimeout(timer);
+        }
+        if (last.status < 500) return last;
+      } catch (e) {
+        if (attempt) throw e;
+      }
+    }
+    return last;
+  }
+
+  function offerRetry(payload) {
+    clearChips();
+    const wrap = document.createElement("div");
+    wrap.className = "faq-chips";
+    const chip = makeChip(T.retry);
+    chip.onclick = () => { clearChips(); post(payload, true); };
+    wrap.appendChild(chip);
+    messagesContainer.appendChild(wrap);
+    scrollToBottom();
+  }
+
+  function recoverFromFailure(payload, keepForm) {
+    if (keepForm) return;
+    if (lastStep) renderStep(lastStep);
+    else offerRetry(payload);
+  }
+
+  async function post(payload, withThinking, onAccepted, keepForm) {
     if (sending) return null;
     sending = true;
     if (withThinking !== false) addThinking();
     try {
-      const res = await fetch(apiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(Object.assign({ sessionId: sessionId }, payload)),
-      });
+      const res = await fetchWithRetry(JSON.stringify(Object.assign({ sessionId: sessionId }, payload)));
       removeThinking();
       if (!res.ok) {
         let msg = T.errGeneric;
         try { const d = await res.json(); if (d && d.answer) msg = d.answer; } catch (e) {}
         addMessage("bot", msg);
+        recoverFromFailure(payload, keepForm);
         return null;
       }
       const data = await res.json();
+      const stateBefore = convState;
       if (data.state && typeof data.state === "object") convState = data.state;
 
       if (typeof data.progress === "number" && typeof data.progressTotal === "number") {
         if (payload.question && data.progress > lastProgress) {
-          track("question_answered", { answered: data.progress, total: data.progressTotal, project_type: convState.projectType });
+          backStack.push(stateBefore);
+          track("question_answered", { field: lastField, answered: data.progress, total: data.progressTotal, project_type: convState.projectType });
         }
         updateProgress(data.progress, data.progressTotal);
         lastProgress = data.progress;
@@ -688,24 +912,37 @@
 
       if (data.done && !quoteDone) {
         quoteDone = true;
+        updateCallbackLink();
         const l = data.lead || {};
         track("quote_completed", { project_type: l.type, quote_total: l.total, vat_basis: l.basis });
       }
 
+      if (data.field && data.field !== lastField) track("step_shown", { field: data.field, answered: data.progress, total: data.progressTotal, project_type: convState.projectType });
+      if (lastField === "__survey" && data.state && data.state.survey_time && !stateBefore.survey_time) track("survey_time_picked", { survey_time: data.state.survey_time });
+      if (!data.callbackFailed) lastField = data.field || null;
+
       const parts = String(data.answer || "").split("[[SPLIT]]").map((s) => s.trim()).filter(Boolean);
-      parts.forEach((p) => addMessage("bot", p));
+      const bubbles = parts.map((p) => addMessage("bot", p));
       if (parts.length) conversationHistory.push({ role: "assistant", content: parts.join("\n\n") });
 
-      if (data.form) renderContactForm(data.form);
-      else if (data.multi) renderMultiChips(data.chips, data.exclusive, data.next);
-      else renderChips(data.chips);
+      if (!data.callbackFailed) lastStep = data; // a failed callback leaves the question open
+      renderStep(lastStep);
+
+      // The estimate is three long bubbles. Land on the price, not below it.
+      if (data.done && bubbles[0]) {
+        // offsetTop, because the bubble's entrance animation skews its live position.
+        const base = bubbles[0].offsetParent === messagesContainer ? 0 : messagesContainer.offsetTop;
+        messagesContainer.scrollTop = bubbles[0].offsetTop - base - 8;
+      }
 
       armIdleFlush();
+      saveChat();
       return data;
     } catch (err) {
       console.error(err);
       removeThinking();
       addMessage("bot", T.errConnect);
+      recoverFromFailure(payload, keepForm);
       return null;
     } finally {
       sending = false;
@@ -721,12 +958,7 @@
     addMessage("user", text);
     if (presetText === undefined) inputElement.value = "";
     conversationHistory.push({ role: "user", content: text });
-    const data = await post({ question: text, history: conversationHistory.slice(-80), state: convState }, true);
-    // A form the customer had open is still owed: put it back if the reply
-    // did not bring its own.
-    if (!data && lastProgressTotal && lastProgress >= lastProgressTotal && !quoteDone) {
-      post({ question: "", history: conversationHistory.slice(-80), state: convState }, false);
-    }
+    await post({ question: text, history: conversationHistory.slice(-80), state: convState }, true);
   }
 
   // --- Host page hooks --------------------------------------------------------------
@@ -751,8 +983,15 @@
     }, true);
   }
 
+  // Wakes the serverless function before the customer's first click, so that
+  // click does not pay for a cold start.
+  function warmUp() {
+    try { fetch(apiUrl, { method: "OPTIONS" }).catch(() => {}); } catch (e) {}
+  }
+
   function init() {
-    initAnalytics();
+    whenIdle(initAnalytics, 3000);
+    whenIdle(warmUp, 2000);
     injectStyles();
     createContainer();
     if (SHOW_LAUNCHER) createLauncher();

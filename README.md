@@ -40,12 +40,35 @@ public/widget.js ──POST──► api/faq-agent.js (shared engine)
 | Illegálisan lerakott hulladék | mennyiség → mi van benne (több is) → hol van → megközelítés → kezdés |
 | Takarítás | típus (nagytakarítás, felújítás/festés/építés utáni, iroda, üzem/csarnok, egyéb) → terület → szennyezettség → ablakok → belmagasság (csarnoknál) → kezdés |
 
-Then one form: név, telefon, település, e-mail (optional), **magánszemély / cég /
-intézmény / társasház**, preferred survey time (optional).
+Then one form: név, telefon, település, **magánszemély / cég / intézmény /
+társasház** (magánszemély preselected). The survey time is asked after the quote.
 
 **Kezdés** is always Amint lehet / 30 / 60 / 90 napon belül. Typing a later start
 ("jövő tavasszal") is politely refused: Banacraft only takes jobs starting within
 3 months.
+
+## Keeping customers in the chat
+
+- **Back** on every question and on the form; **resume** after a reload (kept in
+  sessionStorage, gone when the tab closes).
+- **A failed request** is retried once quietly; after that the customer's buttons
+  or the form (with what they typed) come back.
+- **"Inkább visszahívást kérek"** under the chat sends the owner a "VISSZAHÍVÁS"
+  e-mail with the answers so far. It does not go to Zoho Flow: that webhook
+  expects a priced quote.
+- **Under the finished quote:** survey-time buttons and a tap-to-call button. A
+  picked time e-mails the owner.
+- **Typed answers** that are a button in other words (no accents, "igen", the
+  start of one label) are read without a model call. Typed start dates are judged
+  against today: "télen" is fine in October, "tavasszal" is not.
+- **AI:** 8 s timeout, then the other provider if its key is set, then the buttons.
+  A price in the model's reply is replaced before the customer sees it.
+- **Analytics (PostHog):** `step_shown` and `question_answered` carry `field`, so
+  drop-off shows per question. Also `back_clicked`, `callback_opened`,
+  `callback_requested`, `form_submitted`, `form_error`, `survey_time_picked`,
+  `call_cta_clicked`, `chat_resumed`.
+- **Region:** `vercel.json` runs the function in `fra1` (Frankfurt), close to the
+  customers.
 
 ## Pricing
 
@@ -124,14 +147,13 @@ site's placeholder button and drop `launcher: false`.
 
 - **Finished estimate:** "Árbecslés: név - munka, település" - contact details,
   customer type, every answer, the itemised price, exclusions, warnings (e.g.
-  azbeszt), and the full chat. Reply goes straight to the customer if they gave an
-  e-mail.
+  azbeszt), and the full chat. The phone number and the price are in the subject.
 - **Stopped halfway:** "Félbehagyott beszélgetés: …" - sent when the chat is
   closed, the page is left, or after 3 idle minutes (max 3 per conversation).
 - **Zoho Flow:** same webhook contract as the NM Bau bot, set
   `ZOHO_FLOW_WEBHOOK_URL` to enable. `quote_basis` is `"floor"`, and
-  low = high = total. The payload is still logged with a `[TEMP zoho payload]` line
-  (copied from NM Bau) - remove it once the mapping is verified.
+  low = high = total. The payload is logged as `[zoho payload]` with contact details
+  masked.
 
 ## Editing
 

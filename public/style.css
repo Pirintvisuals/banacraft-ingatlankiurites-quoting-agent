@@ -606,6 +606,39 @@ select.faq-form-input { appearance: auto; }
   .faq-chat-window { top: 8px; bottom: 8px; height: auto; }
 }
 
+/* ---------- Back, call and callback controls ---------- */
+.faq-chip--ghost {
+  border-color: var(--bc-border);
+  background: transparent;
+  color: var(--bc-muted);
+  font-weight: 500;
+}
+.faq-chip-call {
+  background: var(--bc-accent-strong);
+  border-color: var(--bc-accent-strong);
+  color: #ffffff;
+  text-decoration: none;
+  flex-basis: 100%;
+  justify-content: center;
+}
+.faq-chip-call:hover { background: var(--bc-dark); border-color: var(--bc-dark); color: #fff; }
+.faq-link-btn {
+  display: block;
+  margin: 2px auto 0;
+  padding: 4px 8px;
+  min-height: 28px;
+  border: none;
+  background: none;
+  color: var(--bc-accent-ink);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.faq-link-btn[hidden] { display: none; }
+.faq-link-btn:focus-visible { outline: 3px solid var(--bc-dark); outline-offset: 2px; }
+.faq-form-back { margin-top: 6px; }
+
 @media (prefers-reduced-motion: reduce) {
   .faq-launcher-ring { animation: none; }
   .faq-typing span { animation: none; opacity: 0.7; }

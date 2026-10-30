@@ -183,9 +183,12 @@ function emailIssue(email) {
 }
 
 // A Hungarian number is 9 significant digits (+36 / 06 prefix optional).
+// A local landline without its prefix ("1 234 5678") is 8; a number made of one
+// or two digits repeated is someone dodging the form, not a lead.
 function phoneIssue(phone) {
     const d = String(phone || "").replace(/[^\d]/g, "");
-    return d.length >= 9 && d.length <= 13 ? null : "format";
+    if (d.length < 8 || d.length > 13) return "format";
+    return new Set(d).size >= 3 ? null : "format";
 }
 
 // Any settlement, district or postcode is fine; reject only an empty answer and
@@ -241,14 +244,33 @@ function norm(s) {
         .replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();
 }
 
-// A typed area: "65", "kb. 65 nm", "65 m²". Only when the message is basically
-// just the number - "2 szobás, 60 nm" has two numbers and goes to the model.
+// A typed area: "65", "kb. 65 nm", "65 m²-es", "1 200 m2". Only when the message
+// is just the number and its unit - anything else after the number ("2 szobás",
+// "3 emelet") is not an area and goes to the model.
 function parseArea(text) {
-    const m = String(text || "").toLowerCase().replace(",", ".")
-        .match(/^[^\d]{0,12}?(\d{1,5}(?:\.\d+)?)\s*(m2|m²|nm|négyzetméter|negyzetmeter|négyzetméteres|m)?[^\d]{0,12}$/);
+    const m = String(text || "").toLowerCase().trim()
+        .replace(/(\d)[\s.](\d{3})(?!\d)/g, "$1$2")
+        .replace(",", ".")
+        .match(/^(?:kb\.?|körülbelül|korulbelul|nagyjából|nagyjabol|kábé|kabe|cirka|~)?\s*(\d{1,6}(?:\.\d+)?)\s*(?:m2|m²|nm|négyzetméter\p{L}*|negyzetmeter\p{L}*|m)?(?:-?[eéö]s)?\s*(?:kb\.?|körülbelül|korulbelul|nagyjából|nagyjabol|lehet|talán|talan)?[.!]?$/u);
     if (!m) return null;
-    const n = parseFloat(m[1]);
+    const n = Math.round(parseFloat(m[1]) * 10) / 10;
     return n >= 1 && n <= 100000 ? n : null;
+}
+
+// Typed answers that are a button in other words: no accents, a trailing full
+// stop, or the start of exactly one label ("igen" for "Igen, le vannak kötve").
+// Ambiguous or longer text is left to the model.
+const fold = (s) => norm(s).normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[.!]+$/, "");
+function looseOption(opts, text) {
+    const t = fold(text);
+    if (t.length < 2) return null;
+    const same = opts.find((o) => fold(o.label) === t);
+    if (same) return same;
+    const hits = opts.filter((o) => {
+        const l = fold(o.label);
+        return l.startsWith(t) && /^[\s,(]/.test(l.slice(t.length));
+    });
+    return hits.length === 1 ? hits[0] : null;
 }
 
 // Several picks of a multi-select are stored comma-joined. A "none of these"
@@ -274,7 +296,7 @@ function mapAnswer(field, text, sel) {
     if (f.type === "multi") {
         const vals = [];
         for (const p of a.split(MULTI_SEP).map((x) => x.trim()).filter(Boolean)) {
-            const o = byLabel(p);
+            const o = byLabel(p) || looseOption(opts, p);
             if (!o) return null;
             vals.push(o.value);
         }
@@ -286,7 +308,8 @@ function mapAnswer(field, text, sel) {
         const n = parseArea(text);
         if (n != null) return String(n);
     }
-    return null;
+    const loose = looseOption(opts, a);
+    return loose ? loose.value : null;
 }
 
 // The widget carries the state between turns. Nothing in it is trusted: every
@@ -356,7 +379,25 @@ function ackText(field, sel) {
 
 // Customers who want to start later than 90 days are not Banacraft's customers
 // (their call). Caught before any model call, on the timeline question only.
-const TOO_LATE = /(jövőre|jövő\s*(év|tavasz|nyár|ősz|tél)|következő\s*év|fél\s*év|év\s*múlva|\b([4-9]|1[0-2])\s*hónap|\b(négy|öt|hat|hét|nyolc|kilenc|tíz|tizenegy|tizenkét)\s*hónap|tavasszal|nyáron|ősszel|télen|ráér)/i;
+// Seasons and "jövőre" depend on today: "télen" in late October is five weeks
+// away, not a refusal. Those near enough go to the model, which knows the date.
+const TOO_LATE_ALWAYS = /(fél\s*év\s*múlva|fél\s*évre|év\s*múlva|(?<![\p{L}\d])([4-9]|1[0-2])\s*hónap|(?<![\p{L}\d])(négy|öt|hat|hét|nyolc|kilenc|tíz|tizenegy|tizenkét)\s*hónap)/iu;
+const NEXT_YEAR = /(jövőre|(jövő|következő)\s*év)/iu;
+const SEASONS = [[/(?<!\p{L})tavas/iu, 2], [/(?<!\p{L})nyár/iu, 5], [/(?<!\p{L})ős[sz]/iu, 8], [/(?<!\p{L})tél/iu, 11]];
+const DAY_MS = 24 * 60 * 60 * 1000;
+function tooLate(text, now = new Date()) {
+    const s = String(text || "");
+    if (TOO_LATE_ALWAYS.test(s)) return true;
+    const y = now.getFullYear(), m = now.getMonth();
+    if (NEXT_YEAR.test(s)) return (new Date(y + 1, 0, 1) - now) / DAY_MS > 90;
+    const season = SEASONS.find(([re]) => re.test(s));
+    if (!season) return false;
+    const start = season[1];
+    // Already in that season (winter runs over New Year).
+    if (start === 11 ? (m === 11 || m < 2) : (m >= start && m < start + 3)) return false;
+    const next = new Date(m < start ? y : y + 1, start, 1);
+    return (next - now) / DAY_MS > 90;
+}
 const TIMELINE_LIMIT = () =>
     `Köszönöm, hogy jelezte! Jelenleg a **legfeljebb 3 hónapon (90 napon) belül** induló munkákat tudjuk vállalni. ` +
     `Ha a munka ezen belül el tud indulni, válassza ki, mikorra. Ha később lesz aktuális, keressen minket bátran akkor: **${PHONE}**.`;
@@ -366,6 +407,7 @@ const TIMELINE_LIMIT = () =>
 //  so it is one form instead of four more bubbles.
 // ---------------------------------------------------------------------------
 const FORM = "__contact";
+const SURVEY = "__survey"; // the survey-time buttons offered under a finished quote
 const CUSTOMER_TYPES = [
     { label: "Magánszemély", value: "magan" },
     { label: "Cég", value: "ceg" },
@@ -381,18 +423,28 @@ function contactForm(sel) {
     const val = (k) => (has(sel, k) ? String(sel[k]) : "");
     const ct = CUSTOMER_TYPES.find((c) => c.value === sel.customer_type);
     return {
-        title: "Kinek küldjük az árbecslést?",
-        why: "Az adatait csak az árbecslés és a helyszíni felmérés egyeztetéséhez használjuk.",
-        submit: "Kérem az árbecslést",
+        title: "Utolsó lépés: kinek készül az árbecslés?",
+        why: "Az adatait csak az árbecslés és a helyszíni felmérés egyeztetéséhez használjuk. A kérés nem kötelez semmire.",
+        submit: "Kérem az alapárat",
         fields: [
             { key: "name", label: "Név", placeholder: "Az Ön neve", type: "text", autocomplete: "name", value: val("name") },
             { key: "phone", label: "Telefonszám", placeholder: "+36 30 123 4567", type: "tel", autocomplete: "tel", value: val("phone") },
             { key: "postal_code", label: "Település", placeholder: "pl. Budapest XI. vagy Érd", type: "text", autocomplete: "address-level2", value: val("postal_code") },
-            { key: "email", label: "E-mail (nem kötelező)", placeholder: "pelda@gmail.com", type: "email", autocomplete: "email", value: val("email") },
-            { key: "customer_type", label: "Kinek a nevében kéri?", type: "select", options: CUSTOMER_TYPES.map((c) => c.label), value: ct ? ct.label : "" },
-            { key: "survey_time", label: "Mikor jó a helyszíni felmérés? (nem kötelező)", type: "select", options: SURVEY_TIMES, value: val("survey_time"), optional: true },
+            { key: "customer_type", label: "Kinek a nevében kéri?", type: "select", options: CUSTOMER_TYPES.map((c) => c.label), value: ct ? ct.label : CUSTOMER_TYPES[0].label },
         ],
     };
+}
+
+// The "call me instead" shortcut: just enough to ring them back.
+function validateCallback(contact) {
+    const c = contact && typeof contact === "object" ? contact : {};
+    const name = oneLine(c.name).slice(0, 200);
+    const phone = oneLine(c.phone).slice(0, 200);
+    const errors = {};
+    if (name.length < 2) errors.name = "Kérem, adja meg a nevét.";
+    if (!phone) errors.phone = "Kérem, töltse ki.";
+    else if (phoneIssue(phone)) errors.phone = "Ezt a számot nem sikerült értelmezni (pl. +36 30 123 4567).";
+    return Object.keys(errors).length ? { errors } : { values: { name, phone } };
 }
 
 // Validate a whole submitted form at once; errors are keyed by field so the
@@ -481,24 +533,23 @@ function renderCustomerQuote(q, sel) {
     const priceBubble = [
         `Köszönöm, ${oneLine(sel.name)}! Elkészült az **előzetes árbecslés**.`,
         ``,
-        `**${q.title}**`,
-        ...q.items.map((i) => `• ${i.label} - **${formatHuf(i.amount)}**`),
-        ``,
         `**Alapár: ${formatHuf(q.total)}-tól**`,
         `(${vatNote(q)})`,
+        ``,
+        `**${q.title}**`,
+        ...q.items.map((i) => `• ${i.label} - **${formatHuf(i.amount)}**`),
     ].join("\n");
 
     const scope = [`**Mit tartalmaz?**`, `Az alapár ${q.includes}.`, ``, `**Ami az alapáron felül jöhet:**`, ...q.exclusions.map((e) => `• ${e}`)];
     if (q.flags.length) scope.push(``, ...q.flags.map((f) => `**Fontos:** ${f}`));
 
-    const when = sel.survey_time && !/^mindegy/i.test(sel.survey_time) ? ` - lehetőleg **${sel.survey_time.toLowerCase()}**` : "";
     const next = [
         `**Hogyan tovább?**`,
         `• Kollégánk **hamarosan hívja** a megadott számon.`,
-        `• Egyeztetünk egy **ingyenes helyszíni felmérést**${when}.`,
+        `• Egyeztetünk egy **ingyenes helyszíni felmérést**.`,
         `• A felmérés után **írásos, végleges árajánlatot** kap.`,
         ``,
-        `Sürgős? Hívjon most: **${PHONE}**`,
+        `**Mikor lenne jó Önnek a felmérés?**`,
         `Ha kérdése van, írja meg itt nyugodtan.`,
     ].join("\n");
 
@@ -534,7 +585,8 @@ SZABÁLYOK
 // answer never got recorded and the bot sat on the same question.
 function directive(field, sel, mode) {
     const known = summaryPairs(sel).map(([k, v]) => `- ${k}: ${v}`).join("\n") || "- még semmi";
-    const head = `\n\n=== AMIT EDDIG TUDUNK ===\n${known}\n`;
+    const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Budapest" });
+    const head = `\n\nA mai dátum: ${today}. Ha az ügyfél kezdési időpontot mond, ehhez mérd; ha 90 napnál későbbi, az "ertek" null, és mondd el a 90 napos szabályt.\n\n=== AMIT EDDIG TUDUNK ===\n${known}\n`;
     const format = `
 
 === A VÁLASZ FORMÁTUMA ===
@@ -569,6 +621,10 @@ MIT TEGYÉL
 4. Csak a fenti listában szereplő értéket használj, és soha ne tegyél fel ettől eltérő kérdést.`;
 }
 
+// A provider that hangs must not hold the customer's reply: past this the other
+// provider is tried, then the buttons come back.
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS) || 8000;
+
 async function callOpenAI(messages) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return { ok: false, error: "Missing OPENAI_API_KEY" };
@@ -576,10 +632,11 @@ async function callOpenAI(messages) {
         const res = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+            signal: AbortSignal.timeout(AI_TIMEOUT_MS),
             body: JSON.stringify({
                 model: process.env.OPENAI_MODEL || "gpt-4o-mini",
                 messages,
-                temperature: 0.4,
+                temperature: 0.2,
                 max_tokens: 400,
                 response_format: { type: "json_object" },
             }),
@@ -596,29 +653,34 @@ async function callOpenAI(messages) {
 async function callGemini(messages) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) return { ok: false, error: "Missing GEMINI_API_KEY" };
-    const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+    const model = process.env.GEMINI_MODEL || "gemini-3.5-flash";
     const systemMsg = messages.find((m) => m.role === "system");
     const contents = messages
         .filter((m) => m.role !== "system")
         .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+    const request = (thinkingConfig) => fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+            signal: AbortSignal.timeout(AI_TIMEOUT_MS),
+            body: JSON.stringify({
+                system_instruction: systemMsg ? { parts: [{ text: systemMsg.content }] } : undefined,
+                contents,
+                generationConfig: {
+                    temperature: 0.2,
+                    maxOutputTokens: 1500,
+                    responseMimeType: "application/json",
+                    ...(thinkingConfig ? { thinkingConfig } : {}),
+                },
+            }),
+        }
+    );
     try {
-        const res = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-            {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    system_instruction: systemMsg ? { parts: [{ text: systemMsg.content }] } : undefined,
-                    contents,
-                    generationConfig: {
-                        temperature: 0.4,
-                        maxOutputTokens: 800,
-                        responseMimeType: "application/json",
-                        thinkingConfig: { thinkingBudget: 0 },
-                    },
-                }),
-            }
-        );
+        // Thinking settings differ by model generation. A model that rejects
+        // them still answers without them.
+        let res = await request(/^gemini-2/.test(model) ? { thinkingBudget: 0 } : { thinkingLevel: "minimal" });
+        if (res.status === 400) res = await request(null);
         const data = await res.json();
         const cand = data.candidates?.[0];
         const text = (cand?.content?.parts || []).map((p) => p?.text || "").join("");
@@ -638,10 +700,30 @@ async function askModel(sel, history, text, field, mode) {
     }
     const last = messages[messages.length - 1];
     if (!last || last.role !== "user" || last.content.trim() !== text) messages.push({ role: "user", content: text });
-    const provider = (process.env.AI_PROVIDER || "openai").toLowerCase();
-    const result = provider === "gemini" ? await callGemini(messages) : await callOpenAI(messages);
-    if (!result.ok) console.error(`[${provider}] AI hiba:`, result.error);
+    const provider = (process.env.AI_PROVIDER || "openai").toLowerCase() === "gemini" ? "gemini" : "openai";
+    const callers = { openai: callOpenAI, gemini: callGemini };
+    let result = await callers[provider](messages);
+    if (!result.ok) {
+        console.error(`[${provider}] AI hiba:`, result.error);
+        // A retired model or an outage on one provider should not cost a lead
+        // when a key for the other one is set.
+        const other = provider === "gemini" ? "openai" : "gemini";
+        if (process.env[`${other.toUpperCase()}_API_KEY`]) {
+            result = await callers[other](messages);
+            if (!result.ok) console.error(`[${other}] AI hiba:`, result.error);
+        }
+    }
     return result;
+}
+
+// The price only ever comes from lib/flow.js. The prompt forbids the model from
+// naming one, and this catches the time it does anyway.
+const PRICE_TALK = /\d[\d\s.,]*\s*(ft\b|forint|huf\b|ezer\b|millió)/i;
+function withoutPrice(said, mode) {
+    if (!PRICE_TALK.test(said)) return said;
+    return mode === "done"
+        ? "Az árbecslést fent látja. A végleges árat az ingyenes helyszíni felmérés után adjuk."
+        : "Az alapárat a kérdések végén a rendszer számolja ki, utána azonnal látja.";
 }
 
 // Read the model's reply: the JSON contract first; if a provider ignored JSON
@@ -702,9 +784,11 @@ function cleanModelText(text) {
 //  Handler
 // ===========================================================================
 function send(response, sel, answer, key, extra = {}) {
-    const out = { answer, state: sel, chips: [], ...progressOf(sel), ...extra };
+    const out = { answer, state: sel, chips: [], field: key || null, ...progressOf(sel), ...extra };
     if (key === FORM) {
         out.form = contactForm(sel);
+    } else if (key === SURVEY) {
+        out.chips = SURVEY_TIMES;
     } else if (key) {
         const f = fieldDef(key);
         const opts = optionsFor(key, sel);
@@ -775,6 +859,27 @@ export default async function handler(request, response) {
             return send(response, sel, step.text, step.key);
         }
 
+        // --- "Call me instead": a lead from someone who will not finish the
+        // questions. The answers so far go with it, and they can still carry on. ---
+        if (action === "callback") {
+            const res = validateCallback(body.contact);
+            if (res.errors) return response.status(200).json({ answer: "", chips: [], state: sel, ...progressOf(sel), formErrors: res.errors });
+            const sent = await sendTranscriptEmail({ ...sel, ...res.values }, history, {
+                callback: true, sessionId: body.sessionId, pageUrl: body.pageUrl,
+            });
+            if (!sent.ok) {
+                return response.status(200).json({
+                    answer: `Elnézést, ezt most nem sikerült rögzítenünk. Kérjük, hívjon minket: **${PHONE}**.`,
+                    chips: [], state: sel, ...progressOf(sel), callbackFailed: true,
+                });
+            }
+            sel = { ...sel, ...res.values };
+            const step = nextStep(sel);
+            return send(response, sel,
+                `Köszönöm, ${oneLine(sel.name)}! Kollégánk **hamarosan hívja** ezen a számon: ${oneLine(sel.phone)}.\n\nHa közben kíváncsi az alapárra, folytathatjuk:\n\n${step.text}`,
+                step.key, { callbackDone: true });
+        }
+
         // --- Contact form submitted. ---
         if (body.contact) {
             const pending = pendingField(sel);
@@ -800,7 +905,7 @@ export default async function handler(request, response) {
 
         // --- An answer the backend can map on its own (every chip click). ---
         if (field) {
-            if (field === "timeline" && TOO_LATE.test(text)) {
+            if (field === "timeline" && tooLate(text)) {
                 return send(response, sel, TIMELINE_LIMIT(), field);
             }
             const v = mapAnswer(field, text, sel);
@@ -811,11 +916,25 @@ export default async function handler(request, response) {
             }
         }
 
+        // --- A survey-time button under the finished quote. ---
+        const afterQuote = !field && contactReady(sel);
+        if (afterQuote && !sel.survey_time) {
+            const picked = SURVEY_TIMES.find((t) => norm(t) === norm(text));
+            if (picked) {
+                sel = { ...sel, survey_time: picked };
+                await inBackground(sendSurveyEmail(sel));
+                const when = /^mindegy/i.test(picked) ? "" : ` A felmérést lehetőleg **${picked.toLowerCase()}** egyeztetjük.`;
+                return send(response, sel, `Köszönöm, rögzítettem!${when} Kollégánk hamarosan hívja.`, null);
+            }
+        }
+
         // --- Everything else goes to the model. ---
-        const mode = field ? "question" : (contactReady(sel) ? "done" : "form");
+        const mode = field ? "question" : (afterQuote ? "done" : "form");
         const ai = await askModel(sel, history, text, field, mode);
 
         const reading = ai.ok ? interpretModel(ai.text, mode === "question" ? field : null, sel) : null;
+        if (reading) reading.said = withoutPrice(reading.said, mode);
+        const afterQuoteKey = sel.survey_time ? null : SURVEY;
 
         if (!reading || !reading.said) {
             if (mode === "question") {
@@ -826,7 +945,7 @@ export default async function handler(request, response) {
             if (mode === "form") {
                 return send(response, sel, `Kérem, töltse ki a rövid űrlapot, és rögtön mutatom az alapárat. Kérdés esetén hívjon: **${PHONE}**.`, FORM);
             }
-            return send(response, sel, `Erre most nem tudok válaszolni - kollégánk szívesen segít: **${PHONE}**.`, null);
+            return send(response, sel, `Erre most nem tudok válaszolni - kollégánk szívesen segít: **${PHONE}**.`, afterQuoteKey);
         }
 
         if (mode === "question") {
@@ -848,7 +967,7 @@ export default async function handler(request, response) {
             const reasked = /\*\*[^*]*\?\*\*/.test(reading.said) || norm(reading.said).includes(norm(q));
             return send(response, sel, reasked ? reading.said : `${reading.said}\n\n${questionText(field, sel)}`, field);
         }
-        return send(response, sel, reading.said, mode === "form" ? FORM : null);
+        return send(response, sel, reading.said, mode === "form" ? FORM : afterQuoteKey);
     } catch (error) {
         console.error("Function Crash:", error && error.stack || error);
         return response.status(500).json({ answer: `Elnézést, hiba történt. Kérjük, próbálja újra, vagy hívjon minket: ${PHONE}` });
@@ -878,25 +997,31 @@ async function finishQuote(sel, history, response, sessionId) {
     console.log(`Alapár: ${formatHuf(quote.total)}-tól (${vatNote(quote)})`);
     console.log("========================================\n");
 
-    await sendQuoteEmail(sel, quote, [
-        ...(Array.isArray(history) ? history : []),
-        { role: "assistant", content: answer },
-    ]);
+    // The customer is waiting for the price, so the e-mail and the CRM push run in
+    // the background (waitUntil keeps the function alive for them).
+    await inBackground(Promise.all([
+        sendQuoteEmail(sel, quote, [
+            ...(Array.isArray(history) ? history : []),
+            { role: "assistant", content: answer },
+        ]),
+        sendLeadWebhook(sel, quote, "hu", { sessionId }),
+    ]));
 
-    // The CRM push is bookkeeping; the customer is waiting for the quote, so it
-    // runs in the background (waitUntil keeps the function alive for it).
-    const leadDelivery = sendLeadWebhook(sel, quote, "hu", { sessionId }).catch(() => {});
-    if (hasVercelWaitUntil()) {
-        waitUntil(leadDelivery);
-    } else if (process.env.VERCEL) {
-        console.warn("waitUntil nem elerheto - a Zoho webhookot kivarjuk.");
-        await leadDelivery;
-    }
-
-    return response.status(200).json({
-        answer, chips: [], state: sel, done: true, ...progressOf(sel),
+    return send(response, sel, answer, SURVEY, {
+        done: true,
+        call: { label: `Hívom most: ${PHONE}`, tel: PHONE.replace(/\s/g, "") },
         lead: { type: sel.projectType || null, total: quote.total, basis: quote.basis },
     });
+}
+
+function inBackground(work) {
+    const safe = Promise.resolve(work).catch((e) => console.error("Háttérfeladat hiba:", e && e.message));
+    if (hasVercelWaitUntil()) {
+        waitUntil(safe);
+        return Promise.resolve();
+    }
+    // Without Vercel's request context the work would die with the response.
+    return safe;
 }
 
 // ---------------------------------------------------------------------------
@@ -986,9 +1111,8 @@ async function sendLeadWebhook(sel, quote, lang, meta = {}) {
             quote_items: quote.items.map((i) => ({ label: i.label, low: i.amount, high: i.amount })),
         };
 
-        // TEMPORARY - debugging the Zoho Flow mapping. REMOVE once verified: this
-        // writes the customer's name, phone and e-mail into the Vercel logs.
-        console.log("[TEMP zoho payload]", JSON.stringify(payload));
+        // For checking the Zoho Flow mapping; contact details stay out of the logs.
+        console.log("[zoho payload]", JSON.stringify({ ...payload, name: "***", phone: "***", email: "***" }));
         const res = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1024,18 +1148,42 @@ async function resendSend({ from, to, subject, html, text, replyTo }) {
     const payload = { from, to: [to], subject, html };
     if (text) payload.text = text;
     if (replyTo) payload.reply_to = replyTo;
-    try {
-        const res = await fetch("https://api.resend.com/emails", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
-            body: JSON.stringify(payload),
-        });
-        const result = await res.json().catch(() => ({}));
-        if (res.ok) return { ok: true, id: result.id };
-        return { ok: false, status: res.status, error: (result && (result.message || result.name)) || JSON.stringify(result) };
-    } catch (e) {
-        return { ok: false, error: e.message };
+    // This e-mail IS the lead, so a passing failure gets one more try. A rejected
+    // request (bad key, unverified sender) would only fail the same way again.
+    let last = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const res = await fetch("https://api.resend.com/emails", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+                signal: AbortSignal.timeout(EMAIL_TIMEOUT_MS),
+                body: JSON.stringify(payload),
+            });
+            const result = await res.json().catch(() => ({}));
+            if (res.ok) return { ok: true, id: result.id };
+            last = { ok: false, status: res.status, error: (result && (result.message || result.name)) || JSON.stringify(result) };
+            if (res.status < 500 && res.status !== 429) return last;
+        } catch (e) {
+            last = { ok: false, error: e.message };
+        }
     }
+    return last;
+}
+const EMAIL_TIMEOUT_MS = 6000;
+
+// The owner's phone shows the subject before anything else, so the number to
+// ring is in it, and at the top of the body as a tap-to-call link.
+const callLink = (phone) => `<p style="font-size:16px"><b>Hívd:</b> <a href="tel:${esc(String(phone).replace(/[^\d+]/g, ""))}">${esc(phone)}</a></p>`;
+const PHONE_IN_TEXT = /(?:\+?36|06)[\s\-\/]*\d{1,2}[\s\-\/]*\d{3}[\s\-\/]*\d{3,4}/;
+
+async function sendSurveyEmail(sel) {
+    if (!process.env.RESEND_API_KEY) return false;
+    const subject = `Felmérés: ${oneLine(sel.name)}, ${oneLine(sel.phone)} - ${oneLine(sel.survey_time)}`;
+    const text = `${oneLine(sel.name)} a kész árbecslés után megadta, mikor jó a felmérés: ${oneLine(sel.survey_time)}.\nTelefon: ${oneLine(sel.phone)}\nTelepülés: ${oneLine(sel.postal_code)}`;
+    const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5">${callLink(sel.phone)}<p>${esc(sel.name)} a kész árbecslés után megadta, mikor jó a felmérés: <b>${esc(sel.survey_time)}</b>.</p><p>Település: ${esc(sel.postal_code)}</p></div>`;
+    const sent = await resendSend({ from: leadFrom(), to: leadTo(), subject, html, text });
+    if (!sent.ok) console.error("Felmérés e-mail hiba:", sent.error);
+    return sent.ok;
 }
 
 function contactPairs(s) {
@@ -1063,6 +1211,7 @@ async function sendQuoteEmail(sel, quote, transcript) {
     const work = summaryPairs(sel);
     const net = quote.basis === "gross" ? ` (nettó ${formatHuf(quote.netTotal)} + ÁFA)` : "";
 
+    const start = has(sel, "timeline") ? labelFor("timeline", sel.timeline, sel) : "";
     const lines = [`Új árbecslés-kérés érkezett a weboldali asszisztensen keresztül (${FLOW.BOT.service}).`, ""];
     lines.push("ÜGYFÉL", ...cp.map(([k, v]) => `${k}: ${v}`), "");
     lines.push(`A MUNKA (${quote.title})`, ...work.map(([k, v]) => `${k}: ${v}`), "");
@@ -1075,6 +1224,7 @@ async function sendQuoteEmail(sel, quote, transcript) {
 
     const block = (title, rows) => `<p><b>${esc(title)}</b><br>${rows.map(([k, v]) => `${esc(k)}: ${esc(v)}`).join("<br>")}</p>`;
     const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5">
+        ${callLink(sel.phone)}
         <p>Új árbecslés-kérés érkezett a weboldali asszisztensen keresztül (${esc(FLOW.BOT.service)}).</p>
         ${block("Ügyfél", cp)}
         ${block(`A munka (${quote.title})`, work)}
@@ -1084,7 +1234,7 @@ async function sendQuoteEmail(sel, quote, transcript) {
         ${transcriptHtml(transcript) ? `<p><b>Teljes beszélgetés</b></p>${transcriptHtml(transcript)}` : ""}
       </div>`;
 
-    const subject = `Árbecslés: ${oneLine(sel.name) || "névtelen"} - ${quote.title}, ${oneLine(sel.postal_code) || "?"}`;
+    const subject = `Árbecslés: ${oneLine(sel.name) || "névtelen"}, ${oneLine(sel.phone)} - ${quote.title}, ${oneLine(sel.postal_code) || "?"} - ${formatHuf(quote.total)}-tól${start ? ` - Kezdés: ${start}` : ""}`;
     const sent = await resendSend({
         from: leadFrom(), to: leadTo(), subject, html, text: lines.join("\n"),
         replyTo: sel.email && !emailIssue(sel.email) ? oneLine(sel.email) : undefined,
@@ -1107,9 +1257,14 @@ async function sendTranscriptEmail(sel, transcript, meta = {}) {
     const cut = (x) => oneLine(x).slice(0, 160);
     const lead = meta.test
         ? "Ez egy teszt e-mail, amit te magad indítottál. Ha megérkezett, az e-mail küldés működik."
-        : "Ez a beszélgetés nem jutott el a kész árbecslésig, de az érdeklődő elmondta, amit lent olvasol.";
+        : meta.callback
+            ? "Az érdeklődő visszahívást kért, még a kész árbecslés előtt. Amit eddig megadott, lent olvasod."
+            : "Ez a beszélgetés nem jutott el a kész árbecslésig, de az érdeklődő elmondta, amit lent olvasol.";
+    const gavePhone = !meta.test && !meta.callback && Array.isArray(transcript)
+        && transcript.some((m) => m && m.role === "user" && PHONE_IN_TEXT.test(String(m.content)));
 
     const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5">
+        ${meta.callback && s.phone ? callLink(s.phone) : ""}
         <p>${esc(lead)}</p>
         <p><b>Amit eddig tudunk (${esc(flow)})</b></p>
         ${pairs.length ? pairs.map(([k, v]) => `<p style="margin:4px 0"><b>${esc(k)}:</b> ${esc(v)}</p>`).join("") : `<p style="margin:4px 0;color:#6b7280">Még semmit nem adott meg.</p>`}
@@ -1130,7 +1285,9 @@ async function sendTranscriptEmail(sel, transcript, meta = {}) {
     const who = s.name ? oneLine(s.name) : "névtelen érdeklődő";
     const subject = meta.test
         ? "Teszt: a Banacraft chatbot e-mail küldése működik"
-        : `Félbehagyott beszélgetés: ${who} - ${flow}${meta.update ? " (frissítés)" : ""}`;
+        : meta.callback
+            ? `VISSZAHÍVÁS: ${who}, ${oneLine(s.phone)} - ${flow}`
+            : `${gavePhone ? "TELEFONSZÁMOT ÍRT - " : ""}Félbehagyott beszélgetés: ${who} - ${flow}${meta.update ? " (frissítés)" : ""}`;
 
     const sent = await resendSend({
         from: leadFrom(), to: leadTo(), subject, html, text: textBody,
@@ -1198,4 +1355,4 @@ async function runSelfTest(request, response, ip) {
 }
 
 // Exported for the flow tests (no effect in production).
-export { mapAnswer, acceptModelValue, interpretModel, pendingField, projectOrder, optionsFor, sanitizeState, assembleQuote, renderCustomerQuote, summaryPairs, questionText, validateContactForm, TOO_LATE };
+export { mapAnswer, parseArea, phoneIssue, acceptModelValue, interpretModel, pendingField, projectOrder, optionsFor, sanitizeState, assembleQuote, renderCustomerQuote, summaryPairs, questionText, validateContactForm, tooLate };

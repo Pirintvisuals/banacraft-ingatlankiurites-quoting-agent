@@ -10,7 +10,7 @@
 //     off-market is visible at a glance.
 //  3. Guards: a typed >90-day timeline is refused, a bad contact form bounces,
 //     a tampered state is cleaned.
-import handler, { projectOrder, optionsFor, sanitizeState } from "./api/faq-agent.js";
+import handler, { projectOrder, optionsFor, sanitizeState, parseArea, phoneIssue, mapAnswer, tooLate, assembleQuote } from "./api/faq-agent.js";
 import * as FLOW from "./lib/flow.js";
 
 delete process.env.RESEND_API_KEY;
@@ -87,7 +87,20 @@ for (let i = 0; i < N; i++) {
         }
         return q.chips[rnd(q.chips.length)];
     }, { ...CONTACT, customer_type: ["Magánszemély", "Cég", "Intézmény", "Társasház"][rnd(4)] });
-    if (d) { seenTypes.add(d.state.projectType); checkQuote(d, d.state); }
+    if (d) {
+        seenTypes.add(d.state.projectType);
+        checkQuote(d, d.state);
+        // Typing a bigger area must never give a smaller price (rounding aside).
+        const areaField = projectOrder(d.state).find((f) => FLOW.FIELDS[f].type === "area");
+        if (areaField && i % 10 === 0) {
+            let prev = 0;
+            for (let m2 = 5; m2 <= 1500; m2 += 5) {
+                const t = assembleQuote({ ...d.state, [areaField]: String(m2) }).total;
+                if (t < prev - 3000) { fail("bigger area came out cheaper", { m2, t, prev, state: d.state }); break; }
+                prev = t;
+            }
+        }
+    }
 }
 const allTypes = optionsFor("projectType", {}).map((o) => o.value);
 for (const t of allTypes) if (!seenTypes.has(t)) fail(`project type never reached in the walk: ${t}`);
@@ -135,7 +148,7 @@ log(`\n=== ${FLOW.BOT.id}: guards ===`);
     while (pendingOf(data.state) !== "timeline" && !data.form && guard++ < 60) {
         ({ data } = await call({ question: data.multi ? data.chips[data.chips.length - 1] : data.chips[0], history: [], state: data.state }));
     }
-    const late = await call({ question: "jövő tavasszal lenne jó", history: [], state: data.state });
+    const late = await call({ question: "8 hónap múlva lenne jó", history: [], state: data.state });
     if (!/90 napon/.test(late.data.answer) || late.data.state.timeline) fail("far-off timeline was not refused", late.data);
     else log("far-off timeline refused: ok");
 
@@ -155,6 +168,110 @@ log(`\n=== ${FLOW.BOT.id}: guards ===`);
     const dirty = sanitizeState({ projectType: "__proto__", timeline: "d365", name: "x\r\ny", customer_type: "admin" });
     if (dirty.projectType || dirty.timeline || dirty.customer_type || /[\r\n]/.test(dirty.name)) fail("tampered state not cleaned", dirty);
     else log("tampered state cleaned: ok");
+
+    // --- Typed answers read without the model ---
+    const areas = [["65", 65], ["kb. 65 nm", 65], ["65 m²-es", 65], ["1 200 m2", 1200], ["1.200", 1200], ["12,5 nm", 12.5],
+        ["2 szobás", null], ["3 emelet", null], ["2 szobás, 60 nm", null], ["5 db", null], ["nem tudom", null]];
+    for (const [text, want] of areas) if (parseArea(text) !== want) fail(`parseArea("${text}")`, { got: parseArea(text), want });
+    const tl = (t) => mapAnswer("timeline", t, {});
+    if (tl("amint lehet.") !== "asap" || tl("AMINT LEHET") !== "asap") fail("typed button text not matched");
+    if (tl("90 napon") !== "d90") fail("unique start of a label not matched");
+    if (tl("napon") || tl("hát majd meglátjuk") || tl("3")) fail("loose match took an ambiguous answer");
+    const firstType = optionsFor("projectType", {})[0];
+    const noAccents = firstType.label.normalize("NFD").replace(/[̀-ͯ]/g, "");
+    if (mapAnswer("projectType", noAccents, {}) !== firstType.value) fail("label without accents not matched", noAccents);
+
+    // --- "Later" depends on today ---
+    const oct30 = new Date(2026, 9, 30), feb10 = new Date(2026, 1, 10), jul1 = new Date(2026, 6, 1);
+    const later = [["télen", oct30, false], ["tavasszal", oct30, true], ["jövőre", oct30, false], ["jövőre", jul1, true], ["tavasszal", feb10, false],
+        ["ősszel", feb10, true], ["nyáron", jul1, false], ["8 hónap múlva", oct30, true], ["öt hónap múlva", oct30, true], ["fél év múlva", oct30, true],
+        ["3 hónapon belül", oct30, false], ["két héten belül", oct30, false], ["fél éve vettük a házat", oct30, false]];
+    for (const [text, when, want] of later) if (tooLate(text, when) !== want) fail(`tooLate("${text}", ${when.toDateString()})`, { want });
+
+    if (phoneIssue("1 234 5678") || phoneIssue("+36 30 123 4567") || !phoneIssue("11111111") || !phoneIssue("123")) fail("phone check");
+}
+
+// ---------------------------------------------------------------------------
+log(`\n=== ${FLOW.BOT.id}: after the quote, callback, AI and e-mail failures (mocked) ===`);
+{
+    const realFetch = globalThis.fetch;
+    const stub = (fn) => { globalThis.fetch = fn; };
+    const json = (body, status = 200) => ({ ok: status < 400, status, json: async () => body, text: async () => JSON.stringify(body) });
+    const toFirstQuestion = async () => (await call({ action: "start", state: {} })).data;
+
+    // Finished quote offers survey times and a call button; picking one e-mails the owner.
+    const done = await run((q) => q.multi ? q.chips[0] : q.chips[0]);
+    if (!done.done || !done.chips.length || !done.call || !done.call.tel) fail("quote has no next step", done);
+    process.env.RESEND_API_KEY = "test";
+    const mails = [];
+    stub(async (url, init) => { mails.push({ url, body: JSON.parse(init.body) }); return json({ id: "x" }); });
+    const picked = await call({ question: done.chips[0], history: [], state: done.state });
+    if (picked.data.state.survey_time !== done.chips[0]) fail("survey time not recorded", picked.data);
+    if (picked.data.chips.length) fail("survey buttons still offered after picking", picked.data);
+    if (mails.length !== 1 || !/Felmérés/.test(mails[0].body.subject) || !mails[0].body.subject.includes(CONTACT.phone)) fail("survey e-mail wrong", mails);
+
+    // The finished-quote e-mail subject carries the phone number and the price.
+    mails.length = 0;
+    const fresh = await call({ contact: CONTACT, history: [], state: { ...done.state, survey_time: undefined } });
+    const subject = mails[0] && mails[0].body.subject;
+    if (!fresh.data.done || !subject || !subject.includes(CONTACT.phone) || !/Ft-tól/.test(subject)) fail("quote e-mail subject", subject);
+
+    // Callback from the first question: mail sent, flow carries on, name prefilled later.
+    mails.length = 0;
+    const q0 = await toFirstQuestion();
+    const history = [{ role: "assistant", content: "Üdv" }];
+    const cb = await call({ action: "callback", contact: { name: "Teszt Elek", phone: "+36 30 123 4567" }, history, state: q0.state });
+    if (!cb.data.callbackDone || !cb.data.chips.length) fail("callback did not carry on", cb.data);
+    if (!mails[0] || !/^VISSZAHÍVÁS/.test(mails[0].body.subject)) fail("callback e-mail", mails[0] && mails[0].body.subject);
+    const cbBad = await call({ action: "callback", contact: { name: "", phone: "12" }, history, state: {} });
+    if (!cbBad.data.formErrors || !cbBad.data.formErrors.name || !cbBad.data.formErrors.phone) fail("bad callback not rejected", cbBad.data);
+
+    // Resend: a passing 500 is retried; a callback that cannot be delivered says so.
+    let tries = 0;
+    stub(async () => (++tries === 1 ? json({ message: "down" }, 500) : json({ id: "y" })));
+    const retried = await call({ action: "callback", contact: { name: "Teszt Elek", phone: "+36 30 123 4567" }, history, state: {} });
+    if (tries !== 2 || !retried.data.callbackDone) fail("e-mail not retried", { tries });
+    tries = 0;
+    stub(async () => { tries++; return json({ message: "invalid sender" }, 403); });
+    const failed = await call({ action: "callback", contact: { name: "Teszt Elek", phone: "+36 30 123 4567" }, history, state: {} });
+    if (tries !== 1 || !failed.data.callbackFailed || failed.data.callbackDone) fail("hard e-mail failure mishandled", { tries, d: failed.data });
+    delete process.env.RESEND_API_KEY;
+
+    // AI: the model names a price -> replaced. Valid tag -> answer recorded.
+    process.env.AI_PROVIDER = "openai";
+    process.env.OPENAI_API_KEY = "test";
+    const reply = (obj) => json({ choices: [{ message: { content: JSON.stringify(obj) } }] });
+    const firstValue = optionsFor("projectType", {})[0].value;
+    stub(async () => reply({ valasz: "Kb. 250 000 Ft lesz.", ertek: null }));
+    const priced = await call({ question: "mennyibe kerülne kb ez az egész?", history: [], state: {} });
+    if (/250 000/.test(priced.data.answer) || !priced.data.chips.length) fail("model's price reached the customer", priced.data);
+    stub(async () => reply({ valasz: "Értem.", ertek: firstValue }));
+    const tagged = await call({ question: "ezt a munkát kérném el szépen", history: [], state: {} });
+    if (tagged.data.state.projectType !== firstValue) fail("model's answer not recorded", tagged.data);
+
+    // AI: OpenAI down -> Gemini answers. Gemini rejects the thinking setting -> retried without it.
+    process.env.GEMINI_API_KEY = "test";
+    const geminiCalls = [];
+    stub(async (url, init) => {
+        if (String(url).includes("openai")) throw new Error("timeout");
+        const body = JSON.parse(init.body);
+        geminiCalls.push({ url: String(url), thinking: body.generationConfig.thinkingConfig, key: init.headers["x-goog-api-key"] });
+        if (body.generationConfig.thinkingConfig) return json({ error: { message: "bad thinking" } }, 400);
+        return json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ valasz: "Segítek.", ertek: null }) }] } }] });
+    });
+    const failover = await call({ question: "van garancia a munkára?", history: [], state: {} });
+    if (!/Segítek/.test(failover.data.answer)) fail("failover to the other provider", failover.data);
+    if (geminiCalls.length !== 2 || geminiCalls[1].thinking) fail("gemini retry without thinking", geminiCalls);
+    if (geminiCalls.some((c) => c.url.includes("key=")) || geminiCalls[0].key !== "test") fail("gemini key in the URL", geminiCalls);
+
+    // AI: every provider down -> the buttons come back.
+    stub(async () => { throw new Error("down"); });
+    const allDown = await call({ question: "van garancia a munkára?", history: [], state: {} });
+    if (!allDown.data.chips.length) fail("no buttons when the AI is down", allDown.data);
+
+    delete process.env.AI_PROVIDER; delete process.env.OPENAI_API_KEY; delete process.env.GEMINI_API_KEY;
+    globalThis.fetch = realFetch;
+    log("mocked paths: done");
 }
 
 console.log = quiet || console.log;

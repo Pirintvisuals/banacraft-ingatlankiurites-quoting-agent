@@ -639,6 +639,27 @@ select.faq-form-input { appearance: auto; }
 .faq-link-btn:focus-visible { outline: 3px solid var(--bc-dark); outline-offset: 2px; }
 .faq-form-back { margin-top: 6px; }
 
+/* ---------- Exact number under the buttons ---------- */
+.faq-number-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-basis: 100%;
+}
+.faq-number-input {
+  width: 120px;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1.5px solid var(--bc-border);
+  border-radius: 999px;
+  font-size: 16px;
+  color: var(--bc-ink);
+  background: #ffffff;
+}
+.faq-number-input:focus { outline: none; border-color: var(--bc-accent-strong); }
+.faq-number-input--bad { border-color: #DC2626; }
+.faq-number-unit { font-size: 13.5px; font-weight: 600; color: var(--bc-muted); }
+
 @media (prefers-reduced-motion: reduce) {
   .faq-launcher-ring { animation: none; }
   .faq-typing span { animation: none; opacity: 0.7; }

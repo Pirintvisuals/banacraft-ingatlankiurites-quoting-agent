@@ -45,6 +45,8 @@
     concept: "Előzetes, tájékoztató becslés. A végleges árat az ingyenes helyszíni felmérés után adjuk.",
     next: "Tovább",
     back: "Vissza",
+    exactNumber: "Pontos szám",
+    ok: "OK",
     backSaid: "Vissza az előző kérdéshez",
     retry: "Újrapróbálom",
     callbackOpen: "Inkább visszahívást kérek",
@@ -64,7 +66,7 @@
   const POSTHOG_KEY = config.posthogKey || "phc_nroFe9H8K9hbVENBqcRRrWW9GXxoyVZhSomy3U8Zhu4P";
   const POSTHOG_HOST = config.posthogHost || "https://eu.i.posthog.com";
   const CLIENT_ID = config.client || BOT.id;
-  const WIDGET_VERSION = "2026-10-30";
+  const WIDGET_VERSION = "2026-11-05";
   const SESSION_REPLAY = config.sessionReplay !== false;
 
   // PostHog loads when the browser is idle or the chat opens, so it never slows
@@ -550,7 +552,38 @@
     return chip;
   }
 
-  function renderChips(chips, call) {
+  // "Or type the exact number": under the buttons of a quantity question.
+  function numberRow(spec) {
+    const row = document.createElement("form");
+    row.className = "faq-number-row";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.inputMode = "decimal";
+    input.className = "faq-number-input";
+    input.placeholder = T.exactNumber;
+    input.setAttribute("aria-label", T.exactNumber + " (" + spec.unit + ")");
+    const unit = document.createElement("span");
+    unit.className = "faq-number-unit";
+    unit.textContent = spec.unit;
+    const ok = document.createElement("button");
+    ok.type = "submit";
+    ok.className = "faq-chip faq-chip-next";
+    ok.textContent = T.ok;
+    row.appendChild(input);
+    row.appendChild(unit);
+    row.appendChild(ok);
+    row.onsubmit = (e) => {
+      e.preventDefault();
+      const v = input.value.trim().replace(/\s*(m2|m²|m3|m³|db|cm)$/i, "");
+      if (!/^\d+([.,]\d+)?$/.test(v)) { input.focus(); input.classList.add("faq-number-input--bad"); return; }
+      track("exact_number_typed", { field: lastField });
+      clearChips();
+      sendMessage(v + " " + spec.unit);
+    };
+    return row;
+  }
+
+  function renderChips(chips, call, numberInput) {
     clearChips();
     const back = backChip();
     if ((!chips || !chips.length) && !back && !call) return;
@@ -570,6 +603,7 @@
       a.onclick = () => track("call_cta_clicked");
       wrap.appendChild(a);
     }
+    if (numberInput) wrap.appendChild(numberRow(numberInput));
     if (back) wrap.appendChild(back);
     messagesContainer.appendChild(wrap);
     scrollToBottom();
@@ -581,7 +615,7 @@
     if (!step) return;
     if (step.form) renderContactForm(step.form);
     else if (step.multi) renderMultiChips(step.chips, step.exclusive, step.next);
-    else renderChips(step.chips, step.call);
+    else renderChips(step.chips, step.call, step.numberInput);
   }
 
   function goBack() {

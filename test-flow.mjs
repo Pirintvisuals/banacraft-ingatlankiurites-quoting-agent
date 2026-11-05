@@ -10,7 +10,7 @@
 //     off-market is visible at a glance.
 //  3. Guards: a typed >90-day timeline is refused, a bad contact form bounces,
 //     a tampered state is cleaned.
-import handler, { projectOrder, optionsFor, sanitizeState, parseArea, phoneIssue, mapAnswer, tooLate, assembleQuote } from "./api/faq-agent.js";
+import handler, { projectOrder, optionsFor, sanitizeState, parseArea, parseNumber, phoneIssue, mapAnswer, tooLate, assembleQuote } from "./api/faq-agent.js";
 import * as FLOW from "./lib/flow.js";
 
 delete process.env.RESEND_API_KEY;
@@ -64,6 +64,11 @@ async function run(choose, contact = CONTACT) {
 
 function checkQuote(d, ctx) {
     if (!d || !d.done) return fail("no finished quote", { ctx, d });
+    // A job that gets a call instead of a price: no figure may leak to the customer.
+    if (d.lead && d.lead.basis === "call") {
+        if (/Alapár|Ft-tól/.test(d.answer) || !/hamarosan hívja/.test(d.answer)) fail("call-only answer wrong", { ctx, answer: d.answer });
+        return "call";
+    }
     const total = d.lead && d.lead.total;
     if (!(total > 0) || total % 1000 !== 0) fail("total not a positive whole-thousand amount", { ctx, total });
     if (!/Alapár: [\d\s]+Ft-tól/.test(d.answer)) fail("no 'Alapár ... Ft-tól' line", { ctx });
@@ -91,11 +96,13 @@ for (let i = 0; i < N; i++) {
         seenTypes.add(d.state.projectType);
         checkQuote(d, d.state);
         // Typing a bigger area must never give a smaller price (rounding aside).
-        const areaField = projectOrder(d.state).find((f) => FLOW.FIELDS[f].type === "area");
+        const areaField = projectOrder(d.state).find((f) => ["area", "number"].includes(FLOW.FIELDS[f].type));
         if (areaField && i % 10 === 0) {
             let prev = 0;
             for (let m2 = 5; m2 <= 1500; m2 += 5) {
-                const t = assembleQuote({ ...d.state, [areaField]: String(m2) }).total;
+                const q = assembleQuote({ ...d.state, [areaField]: String(m2) });
+                if (q.callOnly) break; // past the size Banacraft prices automatically
+                const t = q.total;
                 if (t < prev - 3000) { fail("bigger area came out cheaper", { m2, t, prev, state: d.state }); break; }
                 prev = t;
             }
@@ -125,7 +132,10 @@ for (const sc of FLOW.TEST_SCENARIOS || []) {
         return labels.join(" · ");
     }, { ...CONTACT, customer_type: sc.customer || "Magánszemély" });
     const total = checkQuote(d, sc.name);
-    if (total != null) {
+    if (sc.call || total === "call") {
+        if (!sc.call || total !== "call") fail(`scenario "${sc.name}": expected ${sc.call ? "a call" : "a price"}`, d && d.lead);
+        else log(`\n--- ${sc.name}: hívás, nincs ár`);
+    } else if (total != null) {
         log(`\n--- ${sc.name}: ${total.toLocaleString("hu-HU")} Ft-tól (${d.lead.basis})`);
         if (sc.min && total < sc.min) fail(`scenario "${sc.name}" below its sanity floor`, { total, min: sc.min });
         if (sc.max && total > sc.max) fail(`scenario "${sc.name}" above its sanity ceiling`, { total, max: sc.max });
@@ -149,7 +159,7 @@ log(`\n=== ${FLOW.BOT.id}: guards ===`);
         ({ data } = await call({ question: data.multi ? data.chips[data.chips.length - 1] : data.chips[0], history: [], state: data.state }));
     }
     const late = await call({ question: "8 hónap múlva lenne jó", history: [], state: data.state });
-    if (!/90 napon/.test(late.data.answer) || late.data.state.timeline) fail("far-off timeline was not refused", late.data);
+    if (!/60 napon/.test(late.data.answer) || late.data.state.timeline) fail("far-off timeline was not refused", late.data);
     else log("far-off timeline refused: ok");
 
     const ok = await call({ question: "30 napon belül", history: [], state: data.state });
@@ -175,18 +185,22 @@ log(`\n=== ${FLOW.BOT.id}: guards ===`);
     for (const [text, want] of areas) if (parseArea(text) !== want) fail(`parseArea("${text}")`, { got: parseArea(text), want });
     const tl = (t) => mapAnswer("timeline", t, {});
     if (tl("amint lehet.") !== "asap" || tl("AMINT LEHET") !== "asap") fail("typed button text not matched");
-    if (tl("90 napon") !== "d90") fail("unique start of a label not matched");
+    if (tl("60 napon") !== "d60") fail("unique start of a label not matched");
     if (tl("napon") || tl("hát majd meglátjuk") || tl("3")) fail("loose match took an ambiguous answer");
     const firstType = optionsFor("projectType", {})[0];
     const noAccents = firstType.label.normalize("NFD").replace(/[̀-ͯ]/g, "");
     if (mapAnswer("projectType", noAccents, {}) !== firstType.value) fail("label without accents not matched", noAccents);
 
-    // --- "Later" depends on today ---
-    const oct30 = new Date(2026, 9, 30), feb10 = new Date(2026, 1, 10), jul1 = new Date(2026, 6, 1);
-    const later = [["télen", oct30, false], ["tavasszal", oct30, true], ["jövőre", oct30, false], ["jövőre", jul1, true], ["tavasszal", feb10, false],
-        ["ősszel", feb10, true], ["nyáron", jul1, false], ["8 hónap múlva", oct30, true], ["öt hónap múlva", oct30, true], ["fél év múlva", oct30, true],
+    // --- "Later" depends on today (60-day limit) ---
+    const oct30 = new Date(2026, 9, 30), nov15 = new Date(2026, 10, 15), feb10 = new Date(2026, 1, 10), jul1 = new Date(2026, 6, 1);
+    const later = [["télen", oct30, false], ["tavasszal", oct30, true], ["jövőre", oct30, true], ["jövőre", nov15, false], ["jövőre", jul1, true],
+        ["tavasszal", feb10, false], ["ősszel", feb10, true], ["nyáron", jul1, false], ["8 hónap múlva", oct30, true], ["öt hónap múlva", oct30, true],
+        ["3 hónap múlva", oct30, true], ["2 hónap múlva", oct30, false], ["egy hónap múlva", oct30, false], ["fél év múlva", oct30, true],
         ["3 hónapon belül", oct30, false], ["két héten belül", oct30, false], ["fél éve vettük a házat", oct30, false]];
-    for (const [text, when, want] of later) if (tooLate(text, when) !== want) fail(`tooLate("${text}", ${when.toDateString()})`, { want });
+    for (const [text, when, want] of later) if (tooLate(text, when, 60) !== want) fail(`tooLate("${text}", ${when.toDateString()})`, { want });
+
+    const units = [["5 db", "db", 5], ["8 cm", "cm", 8], ["12 köbméter", "m³", 12], ["0,5 m3", "m³", 0.5], ["5 db", "m²", null], ["8 cm", "db", null]];
+    for (const [text, unit, want] of units) if (parseNumber(text, unit) !== want) fail(`parseNumber("${text}", ${unit})`, { got: parseNumber(text, unit), want });
 
     if (phoneIssue("1 234 5678") || phoneIssue("+36 30 123 4567") || !phoneIssue("11111111") || !phoneIssue("123")) fail("phone check");
 }

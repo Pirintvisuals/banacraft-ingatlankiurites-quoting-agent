@@ -247,15 +247,32 @@ function norm(s) {
 // A typed area: "65", "kb. 65 nm", "65 m²-es", "1 200 m2". Only when the message
 // is just the number and its unit - anything else after the number ("2 szobás",
 // "3 emelet") is not an area and goes to the model.
-function parseArea(text) {
+// The same goes for the other units a number question can ask in ("5 db",
+// "8 cm", "12 köbméter"); a number with the wrong unit is not an answer.
+const UNIT_WORDS = {
+    "m²": "m2|m²|nm|négyzetméter\\p{L}*|negyzetmeter\\p{L}*|m",
+    "m³": "m3|m³|köbméter\\p{L}*|kobmeter\\p{L}*|köb|kob",
+    "db": "db|darab\\p{L}*",
+    "cm": "cm|centi\\p{L}*",
+};
+const NUMBER_RES = {};
+function parseNumber(text, unit = "m²") {
+    const words = UNIT_WORDS[unit] || UNIT_WORDS["m²"];
+    const re = NUMBER_RES[unit] || (NUMBER_RES[unit] = new RegExp(
+        `^(?:kb\\.?|körülbelül|korulbelul|nagyjából|nagyjabol|kábé|kabe|cirka|~)?\\s*(\\d{1,6}(?:\\.\\d+)?)\\s*(?:${words})?(?:-?[eéöo]s)?\\s*(?:kb\\.?|körülbelül|korulbelul|nagyjából|nagyjabol|lehet|talán|talan)?[.!]?$`, "u"));
     const m = String(text || "").toLowerCase().trim()
         .replace(/(\d)[\s.](\d{3})(?!\d)/g, "$1$2")
         .replace(",", ".")
-        .match(/^(?:kb\.?|körülbelül|korulbelul|nagyjából|nagyjabol|kábé|kabe|cirka|~)?\s*(\d{1,6}(?:\.\d+)?)\s*(?:m2|m²|nm|négyzetméter\p{L}*|negyzetmeter\p{L}*|m)?(?:-?[eéö]s)?\s*(?:kb\.?|körülbelül|korulbelul|nagyjából|nagyjabol|lehet|talán|talan)?[.!]?$/u);
+        .match(re);
     if (!m) return null;
     const n = Math.round(parseFloat(m[1]) * 10) / 10;
-    return n >= 1 && n <= 100000 ? n : null;
+    return n >= (unit === "m³" ? 0.5 : 1) && n <= 100000 ? n : null;
 }
+const parseArea = (text) => parseNumber(text, "m²");
+
+// Number questions: buttons with typical amounts, and the exact figure typed.
+const isNumber = (f) => !!f && (f.type === "number" || f.type === "area");
+const unitOf = (f) => (f && f.unit) || "m²";
 
 // Typed answers that are a button in other words: no accents, a trailing full
 // stop, or the start of exactly one label ("igen" for "Igen, le vannak kötve").
@@ -304,8 +321,8 @@ function mapAnswer(field, text, sel) {
     }
     const o = byLabel(a);
     if (o) return o.value;
-    if (f.type === "area") {
-        const n = parseArea(text);
+    if (isNumber(f)) {
+        const n = parseNumber(text, unitOf(f));
         if (n != null) return String(n);
     }
     const loose = looseOption(opts, a);
@@ -329,8 +346,8 @@ function sanitizeState(raw) {
             if (vals.length) out[field] = [...new Set(vals)].join(",");
         } else if (allowed.has(v)) {
             out[field] = v;
-        } else if (f.type === "area" && parseArea(v) != null) {
-            out[field] = String(parseArea(v));
+        } else if (isNumber(f) && parseNumber(v, unitOf(f)) != null) {
+            out[field] = String(parseNumber(v, unitOf(f)));
         }
     }
     for (const k of CONTACT_KEYS) if (has(raw, k)) out[k] = oneLine(raw[k]).slice(0, 200);
@@ -348,7 +365,7 @@ function labelFor(field, value, sel) {
     if (f.type === "multi") return String(value).split(",").map((v) => (find(v) || {}).label || v).join(", ");
     const o = find(String(value));
     if (o) return o.label;
-    if (f.type === "area") return `${String(value).replace(".", ",")} m²`;
+    if (isNumber(f)) return `${String(value).replace(".", ",")} ${unitOf(f)}`;
     return String(value);
 }
 
@@ -364,6 +381,7 @@ function questionText(field, sel) {
     const hint = textOf(f.hint, sel);
     if (hint) lines.push(hint);
     if (f.type === "multi") lines.push("Több is választható - a végén nyomja meg a **Tovább** gombot.");
+    if (isNumber(f)) lines.push("Válasszon, vagy írja be lent a **pontos számot** - így pontosabb lesz az ár.");
     return lines.join("\n");
 }
 
@@ -377,29 +395,39 @@ function ackText(field, sel) {
     return `${ACK[i]}: **${labelFor(field, sel[field], sel)}**.` + (note ? `\n${note}` : "");
 }
 
-// Customers who want to start later than 90 days are not Banacraft's customers
-// (their call). Caught before any model call, on the timeline question only.
-// Seasons and "jövőre" depend on today: "télen" in late October is five weeks
-// away, not a refusal. Those near enough go to the model, which knows the date.
-const TOO_LATE_ALWAYS = /(fél\s*év\s*múlva|fél\s*évre|év\s*múlva|(?<![\p{L}\d])([4-9]|1[0-2])\s*hónap|(?<![\p{L}\d])(négy|öt|hat|hét|nyolc|kilenc|tíz|tizenegy|tizenkét)\s*hónap)/iu;
+// Customers who want to start later than the flow's limit (60 days for
+// Banacraft) are not Banacraft's customers (their call). Caught before any model
+// call, on the timeline question only. Seasons and "jövőre" depend on today:
+// "télen" in early November is weeks away, not a refusal. Those near enough go
+// to the model, which knows the date. "3 hónapon belül" (within) is not a start
+// date, so it goes to the model too.
+const MAX_START_DAYS = FLOW.BOT.maxStartDays || 90;
+const TOO_LATE_ALWAYS = /(fél\s*év\s*múlva|fél\s*évre|év\s*múlva)/iu;
+const MONTH_WORDS = { egy: 1, két: 2, kettő: 2, három: 3, négy: 4, öt: 5, hat: 6, hét: 7, nyolc: 8, kilenc: 9, tíz: 10, tizenegy: 11, tizenkét: 12 };
+const MONTHS = /(?<![\p{L}\d])(\d{1,2}|egy|két|kettő|három|négy|öt|hat|hét|nyolc|kilenc|tíz|tizenegy|tizenkét)\s*hónap(?!on\s*belül)/iu;
 const NEXT_YEAR = /(jövőre|(jövő|következő)\s*év)/iu;
 const SEASONS = [[/(?<!\p{L})tavas/iu, 2], [/(?<!\p{L})nyár/iu, 5], [/(?<!\p{L})ős[sz]/iu, 8], [/(?<!\p{L})tél/iu, 11]];
 const DAY_MS = 24 * 60 * 60 * 1000;
-function tooLate(text, now = new Date()) {
+function tooLate(text, now = new Date(), maxDays = MAX_START_DAYS) {
     const s = String(text || "");
     if (TOO_LATE_ALWAYS.test(s)) return true;
+    const mm = s.match(MONTHS);
+    if (mm) {
+        const n = /^\d/.test(mm[1]) ? Number(mm[1]) : MONTH_WORDS[mm[1].toLowerCase()];
+        if (n * 30 > maxDays) return true;
+    }
     const y = now.getFullYear(), m = now.getMonth();
-    if (NEXT_YEAR.test(s)) return (new Date(y + 1, 0, 1) - now) / DAY_MS > 90;
+    if (NEXT_YEAR.test(s)) return (new Date(y + 1, 0, 1) - now) / DAY_MS > maxDays;
     const season = SEASONS.find(([re]) => re.test(s));
     if (!season) return false;
     const start = season[1];
     // Already in that season (winter runs over New Year).
     if (start === 11 ? (m === 11 || m < 2) : (m >= start && m < start + 3)) return false;
     const next = new Date(m < start ? y : y + 1, start, 1);
-    return (next - now) / DAY_MS > 90;
+    return (next - now) / DAY_MS > maxDays;
 }
 const TIMELINE_LIMIT = () =>
-    `Köszönöm, hogy jelezte! Jelenleg a **legfeljebb 3 hónapon (90 napon) belül** induló munkákat tudjuk vállalni. ` +
+    `Köszönöm, hogy jelezte! Jelenleg a **legfeljebb ${MAX_START_DAYS} napon belül** induló munkákat tudjuk vállalni. ` +
     `Ha a munka ezen belül el tud indulni, válassza ki, mikorra. Ha később lesz aktuális, keressen minket bátran akkor: **${PHONE}**.`;
 
 // ---------------------------------------------------------------------------
@@ -417,7 +445,12 @@ const CUSTOMER_TYPES = [
 const SURVEY_TIMES = ["Hétköznap délelőtt", "Hétköznap délután", "Szombaton", "Mindegy, hívjanak először"];
 const REQUIRED_CONTACT = ["name", "phone", "postal_code", "customer_type"];
 const contactReady = (s) => REQUIRED_CONTACT.every((k) => has(s, k));
-const FORM_INTRO = "Köszönöm, megvan minden a számításhoz! Már csak az elérhetősége kell, és rögtön mutatom az **alapárat**.";
+// Some jobs get a call instead of a price (the flow says which and why). The
+// form intro must not promise a number those customers will not see.
+const callReason = (sel) => (FLOW.callReason ? FLOW.callReason(sel) : null);
+const formIntro = (sel) => callReason(sel)
+    ? "Köszönöm, megvan minden! Ennél a munkánál kollégánk személyesen ad árat - adja meg, hol érjük el, és **hamarosan hívjuk**."
+    : "Köszönöm, megvan minden a számításhoz! Már csak az elérhetősége kell, és rögtön mutatom az **alapárat**.";
 
 function contactForm(sel) {
     const val = (k) => (has(sel, k) ? String(sel[k]) : "");
@@ -509,6 +542,14 @@ function assembleQuote(sel) {
         const v = n * k;
         return formatHuf(roundTo(v, v >= 10000 ? 1000 : 100));
     };
+    const reason = callReason(sel);
+    if (reason) {
+        return {
+            title: FLOW.title(sel), callOnly: true, reason,
+            notes: FLOW.ownerNotes ? FLOW.ownerNotes(sel) : [],
+            items: [], total: 0, netTotal: 0, basis, exclusions: [], flags: [],
+        };
+    }
     const raw = FLOW.buildQuote(sel, { money });
     const items = raw.items
         .filter((i) => i.amount > 0)
@@ -530,6 +571,20 @@ function vatNote(q) {
 
 // Customer-facing result, as three bubbles split by [[SPLIT]].
 function renderCustomerQuote(q, sel) {
+    if (q.callOnly) {
+        return [
+            `Köszönöm, ${oneLine(sel.name)}! ${q.reason}`,
+            [
+                `**Hogyan tovább?**`,
+                `• Kollégánk **hamarosan hívja** a megadott számon.`,
+                `• Egyeztetünk egy **ingyenes helyszíni felmérést**.`,
+                `• A felmérés után **írásos árajánlatot** kap.`,
+                ``,
+                `**Mikor lenne jó Önnek a felmérés?**`,
+                `Ha kérdése van, írja meg itt nyugodtan.`,
+            ].join("\n"),
+        ].join("\n[[SPLIT]]\n");
+    }
     const priceBubble = [
         `Köszönöm, ${oneLine(sel.name)}! Elkészült az **előzetes árbecslés**.`,
         ``,
@@ -569,7 +624,7 @@ ${FLOW.KNOWLEDGE}
 - A Banacraft mindhárom szolgáltatást végzi: ingatlankiürítés, lomtalanítás és takarítás · belső bontás és épületbontás · azbeszt palatető bontása, elszállítása és új tetőfedés. Ha az ügyfél a másik kettő közül említ valamit, mondd el röviden, hogy abban is szívesen segítünk, és a részleteket kollégánk egyezteti.
 
 SZABÁLYOK
-- Legfeljebb 3 hónapon (90 napon) belül induló munkákat vállalunk. Ha valaki ennél később kezdené, mondd el ezt udvariasan.
+- Legfeljebb ${MAX_START_DAYS} napon belül induló munkákat vállalunk. Ha valaki ennél később kezdené, mondd el ezt udvariasan.
 - Soha ne mondj, ne becsülj és ne számolj árat. Az alapárat a rendszer számolja ki a kérdések végén; ha árat kérdeznek, mondd, hogy néhány kérdés után azonnal megjelenik.
 - Ne ígérj konkrét időpontot, kedvezményt, és semmit, ami nincs a fenti tények között. Ha nem tudod a választ, mondd, hogy ezt kollégánk a felmérésen vagy telefonon pontosítja.
 - Soha ne javasold, hogy az ügyfél maga bontson, vágjon vagy mozgasson azbeszttartalmú anyagot.
@@ -586,7 +641,7 @@ SZABÁLYOK
 function directive(field, sel, mode) {
     const known = summaryPairs(sel).map(([k, v]) => `- ${k}: ${v}`).join("\n") || "- még semmi";
     const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Budapest" });
-    const head = `\n\nA mai dátum: ${today}. Ha az ügyfél kezdési időpontot mond, ehhez mérd; ha 90 napnál későbbi, az "ertek" null, és mondd el a 90 napos szabályt.\n\n=== AMIT EDDIG TUDUNK ===\n${known}\n`;
+    const head = `\n\nA mai dátum: ${today}. Ha az ügyfél kezdési időpontot mond, ehhez mérd; ha ${MAX_START_DAYS} napnál későbbi, az "ertek" null, és mondd el a ${MAX_START_DAYS} napos szabályt.\n\n=== AMIT EDDIG TUDUNK ===\n${known}\n`;
     const format = `
 
 === A VÁLASZ FORMÁTUMA ===
@@ -601,7 +656,7 @@ A "valasz" szövegében használhatsz **félkövért** és "• " kezdetű felso
     const f = fieldDef(field);
     const options = optionsFor(field, sel);
     const multi = f.type === "multi";
-    const area = f.type === "area";
+    const area = isNumber(f);
     const example = multi
         ? `a választott értékek tömbje, pl. ["${options.slice(0, 2).map((o) => o.value).join('", "')}"]`
         : area
@@ -612,7 +667,7 @@ A "valasz" szövegében használhatsz **félkövért** és "• " kezdetű felso
 "${textOf(f.q, sel)}"
 A lehetséges értékek (érték: felirat):
 ${options.map((o) => `- ${o.value}: ${o.label}`).join("\n")}
-${multi ? "Ennél a kérdésnél TÖBB érték is választható.\n" : ""}${area ? "Konkrét négyzetméter is megadható.\n" : ""}` + format + `
+${multi ? "Ennél a kérdésnél TÖBB érték is választható.\n" : ""}${area ? `Konkrét szám is megadható (${unitOf(f)}).\n` : ""}` + format + `
 
 MIT TEGYÉL
 1. Ha az ügyfél üzenete EGYÉRTELMŰEN megválaszolja ezt a kérdést, akár a saját szavaival (pl. "két héten belül" = 30 napon belül, "nincs lift, harmadik emelet" = 1–3. emelet, lift nélkül): "valasz" = egyetlen rövid visszaigazoló mondat, és a következő kérdést NE tedd fel, azt a rendszer teszi fel; "ertek" = ${example}.
@@ -765,9 +820,9 @@ function acceptModelValue(field, raw, sel) {
     }
     const v = one(Array.isArray(raw) ? raw[0] : raw);
     if (v) return v;
-    if (f.type === "area") {
-        const n = typeof raw === "number" ? raw : parseArea(String(raw));
-        if (n != null && n >= 1 && n <= 100000) return String(n);
+    if (isNumber(f)) {
+        const n = typeof raw === "number" ? raw : parseNumber(String(raw), unitOf(f));
+        if (n != null && n > 0 && n <= 100000) return String(n);
     }
     return null;
 }
@@ -798,6 +853,7 @@ function send(response, sel, answer, key, extra = {}) {
             out.exclusive = opts.filter((o) => (f.none || []).includes(o.value)).map((o) => o.label);
             out.next = "Tovább";
         }
+        if (isNumber(f)) out.numberInput = { unit: unitOf(f) };
     }
     return response.status(200).json(out);
 }
@@ -807,7 +863,7 @@ function send(response, sel, answer, key, extra = {}) {
 function nextStep(sel) {
     const next = pendingField(sel);
     if (next) return { text: questionText(next, sel), key: next };
-    return { text: FORM_INTRO, key: FORM };
+    return { text: formIntro(sel), key: FORM };
 }
 
 export default async function handler(request, response) {
@@ -899,7 +955,7 @@ export default async function handler(request, response) {
         const field = pendingField(sel);
         const text = typeof question === "string" ? question.trim() : "";
         if (!text) {
-            const step = field ? { text: questionText(field, sel), key: field } : (contactReady(sel) ? { text: "", key: null } : { text: FORM_INTRO, key: FORM });
+            const step = field ? { text: questionText(field, sel), key: field } : (contactReady(sel) ? { text: "", key: null } : { text: formIntro(sel), key: FORM });
             return send(response, sel, step.text, step.key);
         }
 
@@ -994,7 +1050,7 @@ async function finishQuote(sel, history, response, sessionId) {
     console.log("\n========================================");
     console.log(`ÚJ ÁRBECSLÉS - ${quote.title}`);
     console.log(`Ügyfél: ${sel.name} | ${sel.phone} | ${sel.email || "-"} | ${sel.postal_code}`);
-    console.log(`Alapár: ${formatHuf(quote.total)}-tól (${vatNote(quote)})`);
+    console.log(quote.callOnly ? `Egyedi ajánlat kell: ${quote.reason}` : `Alapár: ${formatHuf(quote.total)}-tól (${vatNote(quote)})`);
     console.log("========================================\n");
 
     // The customer is waiting for the price, so the e-mail and the CRM push run in
@@ -1010,7 +1066,7 @@ async function finishQuote(sel, history, response, sessionId) {
     return send(response, sel, answer, SURVEY, {
         done: true,
         call: { label: `Hívom most: ${PHONE}`, tel: PHONE.replace(/\s/g, "") },
-        lead: { type: sel.projectType || null, total: quote.total, basis: quote.basis },
+        lead: { type: sel.projectType || null, total: quote.callOnly ? null : quote.total, basis: quote.callOnly ? "call" : quote.basis },
     });
 }
 
@@ -1102,12 +1158,13 @@ async function sendLeadWebhook(sel, quote, lang, meta = {}) {
             quote_currency: "HUF",
             // A starting price, not a range: low, high and total are the same
             // floor, and quote_basis says so.
-            quote_low: quote.total,
-            quote_high: quote.total,
-            quote_total: quote.total,
-            quote_basis: "floor",
+            // A job that gets a call instead of a price has no figures at all.
+            quote_low: quote.callOnly ? null : quote.total,
+            quote_high: quote.callOnly ? null : quote.total,
+            quote_total: quote.callOnly ? null : quote.total,
+            quote_basis: quote.callOnly ? "call" : "floor",
             quote_vat: quote.basis,
-            quote_formatted: `${formatHuf(quote.total)}-tól`,
+            quote_formatted: quote.callOnly ? "Egyedi ajánlat (hívás)" : `${formatHuf(quote.total)}-tól`,
             quote_items: quote.items.map((i) => ({ label: i.label, low: i.amount, high: i.amount })),
         };
 
@@ -1212,6 +1269,7 @@ async function sendQuoteEmail(sel, quote, transcript) {
     const net = quote.basis === "gross" ? ` (nettó ${formatHuf(quote.netTotal)} + ÁFA)` : "";
 
     const start = has(sel, "timeline") ? labelFor("timeline", sel.timeline, sel) : "";
+    if (quote.callOnly) return sendCallOnlyEmail(sel, quote, transcript, start);
     const lines = [`Új árbecslés-kérés érkezett a weboldali asszisztensen keresztül (${FLOW.BOT.service}).`, ""];
     lines.push("ÜGYFÉL", ...cp.map(([k, v]) => `${k}: ${v}`), "");
     lines.push(`A MUNKA (${quote.title})`, ...work.map(([k, v]) => `${k}: ${v}`), "");
@@ -1240,6 +1298,42 @@ async function sendQuoteEmail(sel, quote, transcript) {
         replyTo: sel.email && !emailIssue(sel.email) ? oneLine(sel.email) : undefined,
     });
     if (sent.ok) console.log("Árbecslés e-mail elküldve:", sent.id);
+    else console.error("Resend hiba:", sent.error);
+    return sent.ok;
+}
+
+// A job the bot did not price: the customer was told they will be called. The
+// owner gets the answers, why there is no price, and the flow's reference
+// figures (Róbert's own rates applied to the answers) for that call.
+async function sendCallOnlyEmail(sel, quote, transcript, start) {
+    const cp = contactPairs(sel);
+    const work = summaryPairs(sel);
+    const why = plain(quote.reason);
+    const lines = [`Új érdeklődő a weboldali asszisztensen keresztül (${FLOW.BOT.service}). Az ügyfél NEM látott árat - hívást ígértünk.`, ""];
+    lines.push("ÜGYFÉL", ...cp.map(([k, v]) => `${k}: ${v}`), "");
+    lines.push(`A MUNKA (${quote.title})`, ...work.map(([k, v]) => `${k}: ${v}`), "");
+    lines.push("MIÉRT NINCS ÁR", why);
+    if (quote.notes.length) lines.push("", "TÁJÉKOZTATÓ SZÁMÍTÁS (csak neked)", ...quote.notes.map((n) => `- ${plain(n)}`));
+    const tText = transcriptText(transcript);
+    if (tText) lines.push("", "TELJES BESZÉLGETÉS", "", tText);
+
+    const block = (title, rows) => `<p><b>${esc(title)}</b><br>${rows.map(([k, v]) => `${esc(k)}: ${esc(v)}`).join("<br>")}</p>`;
+    const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5">
+        ${callLink(sel.phone)}
+        <p>Új érdeklődő a weboldali asszisztensen keresztül (${esc(FLOW.BOT.service)}). <b>Az ügyfél nem látott árat - hívást ígértünk.</b></p>
+        ${block("Ügyfél", cp)}
+        ${block(`A munka (${quote.title})`, work)}
+        <p><b>Miért nincs ár</b><br>${esc(why)}</p>
+        ${quote.notes.length ? `<p><b>Tájékoztató számítás (csak neked)</b><br>${quote.notes.map((n) => `- ${esc(plain(n))}`).join("<br>")}</p>` : ""}
+        ${transcriptHtml(transcript) ? `<p><b>Teljes beszélgetés</b></p>${transcriptHtml(transcript)}` : ""}
+      </div>`;
+
+    const subject = `Hívást kér: ${oneLine(sel.name) || "névtelen"}, ${oneLine(sel.phone)} - ${quote.title}, ${oneLine(sel.postal_code) || "?"}${start ? ` - Kezdés: ${start}` : ""}`;
+    const sent = await resendSend({
+        from: leadFrom(), to: leadTo(), subject, html, text: lines.join("\n"),
+        replyTo: sel.email && !emailIssue(sel.email) ? oneLine(sel.email) : undefined,
+    });
+    if (sent.ok) console.log("Egyedi ajánlat e-mail elküldve:", sent.id);
     else console.error("Resend hiba:", sent.error);
     return sent.ok;
 }
@@ -1355,4 +1449,4 @@ async function runSelfTest(request, response, ip) {
 }
 
 // Exported for the flow tests (no effect in production).
-export { mapAnswer, parseArea, phoneIssue, acceptModelValue, interpretModel, pendingField, projectOrder, optionsFor, sanitizeState, assembleQuote, renderCustomerQuote, summaryPairs, questionText, validateContactForm, tooLate };
+export { mapAnswer, parseArea, parseNumber, phoneIssue, acceptModelValue, interpretModel, pendingField, projectOrder, optionsFor, sanitizeState, assembleQuote, renderCustomerQuote, summaryPairs, questionText, validateContactForm, tooLate };

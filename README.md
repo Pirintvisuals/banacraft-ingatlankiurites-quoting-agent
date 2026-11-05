@@ -32,20 +32,10 @@ public/widget.js ──POST──► api/faq-agent.js (shared engine)
 
 ## The questions
 
-| Munka | Kérdések |
-|---|---|
-| Lakás, ház, nyaraló, hagyaték, iroda, egyéb | alapterület → telítettség → emelet/lift → teherautó távolsága → külön kezelendő hulladék (több is) → bútorszétszerelés → takarítás utána → kezdés |
-| Pince/padlás, garázs, raktár/csarnok | ugyanez emelet-kérdés nélkül |
-| Telek, udvar | terület → mennyi lom → teherautó → külön kezelendő → kezdés |
-| Illegálisan lerakott hulladék | mennyiség → mi van benne (több is) → hol van → megközelítés → kezdés |
-| Takarítás | típus (nagytakarítás, felújítás/festés/építés utáni, iroda, üzem/csarnok, egyéb) → terület → szennyezettség → ablakok → belmagasság (csarnoknál) → kezdés |
-
-Then one form: név, telefon, település, **magánszemély / cég / intézmény /
-társasház** (magánszemély preselected). The survey time is asked after the quote.
-
-**Kezdés** is always Amint lehet / 30 / 60 / 90 napon belül. Typing a later start
-("jövő tavasszal") is politely refused: Banacraft only takes jobs starting within
-3 months.
+Munka → helyszín → alapterület → telítettség → emelet / lift (lakás, ház) →
+veszélyes hulladék → kezdés. Telek, udvar: mennyiség m³-ben az alapterület
+helyett. Takarítás and illegálisan lerakott hulladék ask only the basics and end
+in a call.
 
 ## Keeping customers in the chat
 
@@ -72,15 +62,30 @@ társasház** (magánszemély preselected). The survey time is asked after the q
 
 ## Pricing
 
-- **A floor, never a range.** Band answers are priced at their lower edge, "Nem
-  tudom" at a modest default, and the assumption is printed ("kb. 12 m³ lommal
-  számol…"). The number can only go up at the survey.
-- **VAT:** magánszemély and társasház see gross (ÁFA-val), cég and intézmény see
-  net + 27% ÁFA. The flow itself prices net.
-- **All rates live in `P` at the top of `lib/flow.js`.** They are
-  market-calibrated starting points, **not Banacraft's own price list** - replace
-  them with Banacraft's numbers as soon as they're known. `npm test` prints sample
-  quotes, so a bad edit shows immediately.
+- **Banacraft's own prices** (Róbert, 2026-10-30 and 2026-11-05), all in `P`
+  at the top of `lib/flow.js`. The full list and the decisions behind it are in
+  `banacraft-arak-2026-10-30.md` next to the three bot folders.
+- **A floor, never a range.** A band button is priced at its lower edge and the
+  assumption is printed; a typed number is priced as typed.
+- **Every quantity question** has buttons AND a field for the exact number
+  ("pontosan lehessen beírni a számokat").
+- **Location first:** Budapest / Pest megye / Pest környéki megye / Távolabb.
+  "Távolabb" skips straight to the start date and gets a call, not a price.
+- **Start within 60 days** (Amint lehet / 30 / 60 napon belül); a typed later
+  start is politely refused.
+- **No price, a call instead** for the jobs listed below: the customer sees why
+  and "kollégánk hamarosan hívja"; the owner gets a "Hívást kér" e-mail with the
+  answers and, where there is a rate, Róbert's figure for the call. Zoho gets
+  `quote_basis: "call"` and no amounts.
+- **VAT:** magánszemély and társasház see gross, cég and intézmény see net + ÁFA.
+- `npm test` clicks every scenario through and checks the exact total.
+- **Per m³:** Budapest 9 900 Ft (min. 4 m³), Pest megye 10 900 Ft (min. 5 m³),
+  környező megye 10 900 Ft (min. 8 m³). +10% per floor without a lift.
+  Veszélyes hulladék 29 900 Ft/m³.
+- **Volume** = floor area × fill: "normál" is half the m² (Róbert's rule); the
+  other fill levels (0,15 / 0,75 / 1) are Milán's assumptions - check them.
+- **A call instead of a price:** takarítás, illegális hulladék, over 100 m³,
+  Távolabb.
 
 ## Run, test, deploy
 
@@ -148,6 +153,8 @@ site's placeholder button and drop `launcher: false`.
 - **Finished estimate:** "Árbecslés: név - munka, település" - contact details,
   customer type, every answer, the itemised price, exclusions, warnings (e.g.
   azbeszt), and the full chat. The phone number and the price are in the subject.
+- **No price, a call promised:** "Hívást kér: név, telefon - munka, település" -
+  the answers, why there was no price, and the reference figure where there is one.
 - **Stopped halfway:** "Félbehagyott beszélgetés: …" - sent when the chat is
   closed, the page is left, or after 3 idle minutes (max 3 per conversation).
 - **Zoho Flow:** same webhook contract as the NM Bau bot, set

@@ -66,7 +66,7 @@
   const POSTHOG_KEY = config.posthogKey || "phc_nroFe9H8K9hbVENBqcRRrWW9GXxoyVZhSomy3U8Zhu4P";
   const POSTHOG_HOST = config.posthogHost || "https://eu.i.posthog.com";
   const CLIENT_ID = config.client || BOT.id;
-  const WIDGET_VERSION = "2026-11-05";
+  const WIDGET_VERSION = "2026-11-10";
   const SESSION_REPLAY = config.sessionReplay !== false;
 
   // PostHog loads when the browser is idle or the chat opens, so it never slows
@@ -86,8 +86,26 @@
     else setTimeout(fn, ms);
   }
 
+  // A host page with a cookie banner sets requireConsent: then PostHog starts
+  // only after "Elfogadom" (localStorage bc_consent, or the banacraft:consent
+  // event), and stops again if the visitor later withdraws it.
+  const REQUIRE_CONSENT = config.requireConsent === true;
+  function consentGiven() {
+    if (!REQUIRE_CONSENT) return true;
+    try { return localStorage.getItem("bc_consent") === "granted"; } catch (e) { return false; }
+  }
+  window.addEventListener("banacraft:consent", (e) => {
+    if (e.detail !== "granted") {
+      if (analyticsStarted) { try { window.posthog.opt_out_capturing(); } catch (err) {} }
+    } else if (analyticsStarted) {
+      try { window.posthog.opt_in_capturing(); } catch (err) {}
+    } else {
+      initAnalytics();
+    }
+  });
+
   function initAnalytics() {
-    if (analyticsStarted) return;
+    if (analyticsStarted || !consentGiven()) return;
     analyticsStarted = true;
     const waiting = queuedEvents;
     queuedEvents = [];
@@ -105,6 +123,8 @@
         },
       });
       window.posthog.register({ client: CLIENT_ID, widget_version: WIDGET_VERSION, language: navigator.language || "" });
+      // A visitor who once withdrew consent is remembered by PostHog as opted out.
+      if (REQUIRE_CONSENT) window.posthog.opt_in_capturing();
     } catch (e) {}
     waiting.forEach(([event, props]) => track(event, props));
   }
